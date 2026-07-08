@@ -1,0 +1,2 @@
+# Enable DHCP ARP check to detect IP address conflicts on the network
+CONFIG_LWIP_DHCP_DOES_ARP_CHECK=y
