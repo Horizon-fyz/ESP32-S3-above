@@ -45,6 +45,7 @@
 #include "imu.h"
 #include "servo.h"
 #include "control.h"
+#include "rdk_uart.h"
 
 /* ========== TCP 服务器配置 ========== */
 #define TCP_HOST_PORT     8080    /* 上位机 (笔记本) */
@@ -77,7 +78,8 @@ static TaskHandle_t s_status_report_task_handle = NULL;
 /* 主 → 远端 转发 (由 control 模块通过回调调用)
  *
  * 收到上位机 16B 控制帧后, 若 flags bit1 置位, 主节点构造 8B 子帧
- * 通过 socket 1 发给远端. */
+ * 通过 socket 1 发给远端. 8B 子帧携带 speed+yaw+light+dir, 远端
+ * 自行做差速混合. */
 static void forward_to_remote(const ctrl_command_t *cmd)
 {
     if (!s_remote_connected) {
@@ -85,15 +87,15 @@ static void forward_to_remote(const ctrl_command_t *cmd)
         return;
     }
 
-    /* 构造 8B 子帧: AA 55 cmd remote_esc1 remote_esc2 0 0 CRC */
+    /* 构造 8B 子帧: AA 55 cmd speed yaw remote_light remote_dir CRC */
     uint8_t fwd[CTRL_FWD_FRAME_SIZE];
     fwd[0] = CTRL_CTRL_HEAD_0;
     fwd[1] = CTRL_CTRL_HEAD_1;
     fwd[2] = cmd->cmd;
-    fwd[3] = (uint8_t)cmd->remote_esc[0];
-    fwd[4] = (uint8_t)cmd->remote_esc[1];
-    fwd[5] = 0;
-    fwd[6] = 0;
+    fwd[3] = (uint8_t)cmd->speed;
+    fwd[4] = (uint8_t)cmd->yaw;
+    fwd[5] = cmd->remote_light;
+    fwd[6] = cmd->remote_dir;
     uint8_t crc = 0;
     for (int i = 0; i < 7; i++) crc ^= fwd[i];
     fwd[7] = crc;
@@ -241,7 +243,7 @@ static void tcp_server_task(void *pvParameters)
     }
 }
 
-/* MPU 推送任务: 20Hz 读取本地 MPU, 推送到上位机 + 远端 */
+/* MPU 推送任务: 20Hz 读取本地 MPU, 推送到上位机 + 远端 + (RDK 主动请求时发) */
 static void mpu_push_task(void *pvParameters)
 {
     esp_task_wdt_delete(NULL);
@@ -249,10 +251,18 @@ static void mpu_push_task(void *pvParameters)
     const TickType_t period = pdMS_TO_TICKS(50);  /* 20Hz */
 
     imu_data_t m = {0};
+    QueueHandle_t rdk_q = rdk_uart_get_mpu_request_queue();
 
     while (1) {
         esp_task_wdt_reset();
         vTaskDelayUntil(&last_wake, period);
+
+        /* 检查 RDK 是否请求 MPU (非阻塞) */
+        uint8_t dummy;
+        bool rdk_request = false;
+        if (rdk_q) {
+            rdk_request = (xQueueReceive(rdk_q, &dummy, 0) == pdTRUE);
+        }
 
         /* 读取本地 MPU (静默失败时不上报) */
         if (imu_read(&m) == ESP_OK) {
@@ -271,6 +281,10 @@ static void mpu_push_task(void *pvParameters)
             }
             /* 推远端 (type=LOCAL, 远端知道是主节点发的) */
             push_mpu_to_remote(CTRL_MPU_TYPE_LOCAL, ax, ay, az, gx, gy, gz);
+            /* RDK 主动请求时立即推送 */
+            if (rdk_request) {
+                rdk_uart_send_mpu(CTRL_MPU_TYPE_LOCAL, ax, ay, az, gx, gy, gz);
+            }
         }
     }
 }
@@ -340,6 +354,11 @@ static void start_components(void)
     motor_config_t mcfg = motor_get_default_config();
     ESP_ERROR_CHECK(motor_init(&mcfg));
 
+    /* 6.5 RDK X5 UART (后续扩展, 不会阻塞启动) */
+    if (rdk_uart_init() != ESP_OK) {
+        ESP_LOGW(TAG, "RDK UART 初始化失败, 继续运行");
+    }
+
     /* 7. 等待 link up (30s 超时) */
     ESP_LOGI(TAG, "等待网线连接...");
     int wait_ms = 0;
@@ -372,6 +391,7 @@ static void start_components(void)
     esp_log_level_set("wiznet_spi", ESP_LOG_INFO);
     esp_log_level_set("TCP",        ESP_LOG_INFO);
     esp_log_level_set("control",    ESP_LOG_INFO);
+    esp_log_level_set("rdk_uart",   ESP_LOG_INFO);
 
     /* 9. 创建任务 */
     xTaskCreate(status_led_task,    "led",     2048, NULL, 5, NULL);

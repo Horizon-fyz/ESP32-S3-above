@@ -1,7 +1,7 @@
 # ESP32-S3 水下机器人 net-manager 项目参数总览
 
 > 📌 本文档为唯一项目参数权威来源, 所有代码改动须与本文档一致.
-> 文档版本: v3.0 (2026-XX-XX, 新架构)
+> 文档版本: **v5.0** (新增 RDK X5 UART 通信)
 
 ---
 
@@ -11,28 +11,33 @@
 
 | 节点 | 角色 | 硬件 | 网络角色 |
 |---|---|---|---|
-| **主控制节点** (本项目) | 核心控制 + 数据处理 + 指令分发 | MPU6050 + 2 ESC + 1 L298N + 2 舵机 | TCP **Server** (双端口) |
+| **主控制节点** (本项目) | 核心控制 + 数据处理 + 指令分发 | MPU6050 + 2 ESC + 1 L298N + 2 舵机 | TCP **Server** (双端口) + **UART** (RDK X5) |
 | **远端执行节点** (另一 ESP32-S3, 用户负责) | 远端执行 + 本地传感 | MPU6050 + 2 ESC | TCP **Client** |
-| **上位机** (笔记本) | 人工控制 + 姿态解算 + 决策 | 无 (软件) | TCP **Client** |
+| **RDK X5** (地平线 AI 开发板) | 视觉处理 + AI 识别 (网络摄像头) | 摄像头 + AI 算力 | **UART** (本节点) |
+| **网络摄像头** (局域网) | 视频源 | 摄像头 | IP 视频流 (RTSP/HTTP) |
+| **上位机** (笔记本) | 人工控制 + 姿态解算 + 决策 | 无 (软件) | TCP **Client** + 接收 RDK X5 AI 结果 |
 
 ### 1.2 网络拓扑
 
 ```
-   上位机 (笔记本)                        远端 ESP32-S3
-   TCP Client 8080                       TCP Client 8081
-        │                                      │
-        │ 16B 控制帧 (4 电调+L298N+2 舵机)     │ 8B 子帧 (2 电调)
-        │ 16B MPU 帧 (本+远端 MPU, 20Hz)      │ 16B MPU 帧 (远端 MPU, 20Hz)
-        ▼                                      ▼
-   ┌────────────────────────────────────────────────────┐
-   │  主控制节点 (本工程) - TCP Server 双端口            │
-   │  socket 0 = 8080 (HOST, 上位机)                    │
-   │  socket 1 = 8081 (REMOTE, 远端)                    │
-   │  + 本地执行 (ESC1/2 + L298N + 舵机)                │
-   │  + 转发 (16B 控制帧 → 8B 子帧)                     │
-   │  + 推送 (本 MPU 20Hz 推到主机+远端)                │
-   │  + 转发 (远端 MPU 20Hz 转发到主机)                 │
-   └────────────────────────────────────────────────────┘
+   上位机 (笔记本)                远端 ESP32-S3          RDK X5 (地平线)
+   TCP Client 8080               TCP Client 8081       UART0 115200
+        │                              │                    │
+        │ 16B 控制帧 (speed+yaw)       │ 8B 子帧           │ 0xCC 0x77 帧
+        │ 16B MPU 帧 (本+远端, 20Hz)   │ 16B MPU 帧        │ (RDK 主动)
+        ▼                              ▼                    ▼
+   ┌────────────────────────────────────────────────────────────┐
+   │  主控制节点 (本工程) - TCP Server + UART                   │
+   │  socket 0 = 8080 (HOST)                                   │
+   │  socket 1 = 8081 (REMOTE)                                 │
+   │  UART0 = 43/44 (RDK X5)                                   │
+   │  + 本地执行 (ESC1/2 + L298N + 舵机)                       │
+   │  + 转发 (16B 控制 → 8B 子帧)                              │
+   │  + 推送 (本 MPU 20Hz → 主机+远端+RDK 请求)                 │
+   │  + 转发 (远端 MPU 20Hz → 主机)                            │
+   └────────────────────────────────────────────────────────────┘
+                                                               │
+                              网络摄像头 (LAN) ──── IP 视频流 ──┘
 ```
 
 ### 1.3 数据流向
@@ -58,35 +63,37 @@
 | 转发子帧 | 0xAA 0x55 | 8B | 主 → 远端 | 远端电调 + 系统命令 |
 | MPU 数据帧 | 0xBB 0x66 | 16B | 双向 | 6 轴 IMU 原始数据 |
 
-### 2.2 控制帧 (16B) — 上位机 → 主控制节点
+### 2.2 控制帧 (16B) — 上位机 → 主控制节点 (v4.0 差速版)
 
 | 字节 | 名称 | 类型 | 含义 |
 |---|---|---|---|
 | 0 | HEAD0 | uint8 | 0xAA (固定) |
 | 1 | HEAD1 | uint8 | 0x55 (固定) |
 | 2 | cmd | uint8 | 0x10=电机 / 0x20=急停 / 0x30=重启 / 0x40=关机 |
-| 3 | local_esc1 | int8 | 本地电调 1 油门 (-100 ~ +100) |
-| 4 | local_esc2 | int8 | 本地电调 2 油门 (-100 ~ +100) |
-| 5 | remote_esc1 | int8 | 远端电调 1 油门 (-100 ~ +100) |
-| 6 | remote_esc2 | int8 | 远端电调 2 油门 (-100 ~ +100) |
-| 7 | dc_packed | uint8 | 高 4 位=DC 速度 (0~15), 低 4 位=方向 (0停/1正/2反) |
-| 8 | servo0_angle | uint8 | 舵机 0 角度 (0~180) |
-| 9 | servo1_angle | uint8 | 舵机 1 角度 (0~180) |
+| 3 | **speed** | **int8** | **整体推进速度 (-100~+100, 正=前进)** |
+| 4 | **yaw** | **int8** | **偏航/转向 (-100~+100, 正=右转)** |
+| 5 | **remote_light** | **uint8** | **远端灯开关 (0=关, 1=开)** |
+| 6 | **remote_dir** | **uint8** | **远端电机 (0=停, 1=正, 2=反)** |
+| 7 | reserved | uint8 | 保留 (L298N 由 speed 自动计算) |
+| 8-9 | ~~servo~~ | ~~uint8~~ | **~~已删除~~** (原舵机控制) |
 | 10 | flags | uint8 | bit0: 本地执行 / bit1: 转发远端 |
 | 11-14 | reserved | uint8 | 保留 |
 | 15 | CRC8 | uint8 | 前 15 字节异或 |
 
-### 2.3 转发子帧 (8B) — 主控制节点 → 远端
+### 2.3 转发子帧 (8B) — 主控制节点 → 远端 (v4.0)
 
 | 字节 | 名称 | 类型 | 含义 |
 |---|---|---|---|
 | 0 | HEAD0 | uint8 | 0xAA |
 | 1 | HEAD1 | uint8 | 0x55 |
 | 2 | cmd | uint8 | 同控制帧 |
-| 3 | remote_esc1 | int8 | 远端电调 1 油门 |
-| 4 | remote_esc2 | int8 | 远端电调 2 油门 |
-| 5-6 | reserved | uint8 | 保留 |
+| 3 | **speed** | **int8** | **速度** |
+| 4 | **yaw** | **int8** | **偏航** |
+| 5 | **remote_light** | **uint8** | **远端灯开关** |
+| 6 | **remote_dir** | **uint8** | **远端电机方向+停止** |
 | 7 | CRC8 | uint8 | 前 7 字节异或 |
+
+**远端做差速混合** (与主节点本地相同公式) 后驱动 2 电调, 并直接控制灯+电机.
 
 ### 2.4 MPU 数据帧 (16B) — 双向
 
@@ -121,12 +128,40 @@
 
 | 值 | 名称 | 行为 |
 |---|---|---|
-| 0x10 | MOTOR | 电机控制 (按 flags 执行) |
+| 0x10 | MOTOR | 电机控制 (差速混合, 按 flags 执行) |
 | 0x20 | STOP | 紧急停止所有电机 (本地 + 远端) |
 | 0x30 | REBOOT | 系统重启 (主控制节点, 500ms 延迟) |
 | 0x40 | SHUTDOWN | 深度睡眠关机 |
 
 > ⚠️ REBOOT / SHUTDOWN 命令作用于**主控制节点本身**, 不转发到远端.
+
+### 2.7 差速混合算法 (主节点本地 + 远端)
+
+主节点收到控制帧 (speed, yaw) 后, 进行差速混合并执行本地电机:
+
+```
+left_esc  = clamp(speed + yaw, -100, +100)   →  本地 ESC1
+right_esc = clamp(speed - yaw, -100, +100)   →  本地 ESC2
+dc_speed  = |speed|                          →  L298N PWM (0~100%)
+dc_dir    = sign(speed)                      →  L298N IN1/IN2
+                                              0=停, +1=正, -1=反
+```
+
+远端收到 8B 子帧后, 做**完全相同**的混合:
+
+```
+remote_esc1 = clamp(speed + yaw, -100, +100)
+remote_esc2 = clamp(speed - yaw, -100, +100)
+remote_light = frame[5]  (0=关, 1=开)
+remote_dir   = frame[6]  (0=停, 1=正, 2=反)
+```
+
+控制律基于本地 MPU:
+- 主机 (笔记本) 接收 20Hz MPU 原始数据 (本+远端 MPU)
+- 主机做姿态解算 + 控制律 (例如保持水平、循迹)
+- 主机发 speed+yaw 高速率指令 (例如 50Hz)
+- ESP32 主节点只做开环差速混合, 不做姿态闭环
+- 这样 ESP32 算力极小, 主要算力留给笔记本
 
 ---
 
@@ -162,6 +197,8 @@
 | SPI2_MISO | GPIO13 | wiznet.c | W5500 MISO | ✅ |
 | SPI2_CS | GPIO10 | wiznet.c | W5500 CS | ✅ |
 | W5500_INT | GPIO9 | wiznet.c | W5500 中断输出 (下降沿) | ✅ |
+| RDK_UART_TX | GPIO43 | rdk_uart.c | UART0 TX → RDK X5 RX | ✅ |
+| RDK_UART_RX | GPIO44 | rdk_uart.c | UART0 RX ← RDK X5 TX | ✅ |
 
 > ⚠️ **引脚冲突警告**:
 >   - GPIO12 同时是 W5500 SPI SCK 和 ESP32-S3 板载 SPI flash IO2, **不能**用作普通 GPIO
@@ -210,6 +247,7 @@
 | servo | components/servo/ | PCA9685 驱动 | servo_init, servo_set_angle, servo_set_pulse_us |
 | motor | components/motor/ | ESC + L298N | motor_init, motor_set_esc_throttle, motor_set_dc_speed, motor_emergency_stop |
 | control | components/control/ | 16B 帧协议 | control_process, control_set_forward_callback, control_build_*_frame |
+| **rdk_uart** | **components/rdk_uart/** | **RDK X5 UART 通信** | **rdk_uart_init, rdk_uart_send_mpu, rdk_uart_get_mpu_request_queue** |
 | tcp_parser | components/tcp_parser/ | (遗留, 暂未用) | - |
 
 ---
@@ -248,35 +286,136 @@ void control_build_mpu_frame(uint8_t *frame, uint8_t type,
 uint32_t control_get_frame_count(void);
 ```
 
+## 9. RDK X5 UART 通信 (v5.0 新增)
+
+### 9.1 硬件
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| UART 编号 | UART_NUM_0 | ESP32-S3 专用硬件 UART |
+| TX GPIO | 43 (U0TXD) | → RDK X5 RX |
+| RX GPIO | 44 (U0RXD) | ← RDK X5 TX |
+| 波特率 | 115200 | 8N1, 无流控 |
+| console | USB-Serial/JTAG | 释放 UART0 给 RDK X5 |
+
+### 9.2 协议格式
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 帧头 0xCC 0x77                                                │
+│   [0]  0xCC         帧头 1                                    │
+│   [1]  0x77         帧头 2                                    │
+│   [2]  type         类型 (见下表)                              │
+│   [3]  len          负载长度 (0~200)                          │
+│   [4..4+len-1]      payload (变长)                             │
+│   [4+len]           CRC8 (前 N 字节异或)                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.3 帧类型
+
+| type | 名称 | 方向 | 用途 |
+|---|---|---|---|
+| 0x01 | PING | RDK→ESP | 心跳查询 |
+| 0x02 | GET_MPU | RDK→ESP | 请求 MPU 原始数据 |
+| 0x03 | GET_STATUS | RDK→ESP | 请求系统状态 |
+| 0x10 | AI_RESULT | RDK→ESP | AI 识别结果 (预留扩展) |
+| 0x80 | PONG | ESP→RDK | 心跳应答 |
+| 0x81 | MPU_FRAME | ESP→RDK | 16B MPU 原始数据 (复用 TCP MPU 帧格式) |
+| 0x82 | STATUS | ESP→RDK | 系统状态 (JSON 文本) |
+
+### 9.4 RDK X5 主动模式
+
+- RDK X5 主动发请求 (PING, GET_MPU, GET_STATUS)
+- ESP32 立即应答 (PONG, MPU_FRAME, STATUS)
+- AI_RESULT 类型预留, 后续可扩展用于 RDK 主动上报 AI 结果
+
+### 9.5 RDK X5 端参考 (Python)
+
+```python
+import serial
+import struct
+
+HEAD = b'\xCC\x77'
+def crc8(data):
+    c = 0
+    for b in data: c ^= b
+    return c
+
+def send_ping(ser):
+    frame = HEAD + b'\x01' + b'\x00' + bytes([crc8(HEAD + b'\x01\x00')])
+    ser.write(frame)
+
+def send_get_mpu(ser):
+    frame = HEAD + b'\x02' + b'\x00' + bytes([crc8(HEAD + b'\x02\x00')])
+    ser.write(frame)
+
+def parse_frame(data):
+    if len(data) < 5: return None
+    if data[0:2] != HEAD: return None
+    type_ = data[2]
+    length = data[3]
+    payload = data[4:4+length]
+    crc = data[4+length]
+    if crc != crc8(data[:4+length]): return None
+    return type_, payload
+
+# 用法
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.1)
+send_ping(ser)
+resp = ser.read(64)
+frame = parse_frame(resp)
+if frame and frame[0] == 0x80:
+    print("PONG received")
+```
+
 ---
 
-## 9. 远端节点开发接口 (供用户参考)
+## 10. 远端节点开发接口 (供用户参考)
 
 远端 ESP32-S3 (TCP Client 8081) 需实现:
 
 1. **连接**: 主动 connect 主节点 192.168.29.10:8081
 2. **接收 8B 子帧** (帧头 0xAA 0x55):
-   - 解析 cmd + 2 个远端电调油门
-   - 直接控制远端 2 个电调
+   - 解析 `cmd` + `speed` + `yaw` + `remote_light` + `remote_dir`
+   - 做差速混合 → 控制 2 个电调
+   - 直接控制灯+电机
 3. **接收 16B MPU 帧** (帧头 0xBB 0x66, type=0x01):
    - 主节点发来的本节点 MPU 数据 (备用, 不必处理)
 4. **20Hz 发送 16B MPU 帧** (帧头 0xBB 0x66, type=0x02):
    - 远端 MPU 原始数据
    - 上位机做姿态解算 (ESP32 不融合)
 
-### 远端伪代码示例
+### 远端伪代码示例 (v4.0)
 
 ```c
 // 远端 TCP Client 循环
 while (1) {
-    // 1. 接收并解析 8B 子帧 → 控制电调
+    // 1. 接收并解析 8B 子帧 → 差速混合 → 控制电调 + 灯 + 电机
     n = recv(sock, buf, 8, 0);
     if (n == 8 && buf[0] == 0xAA && buf[1] == 0x55) {
         if (crc_check(buf, 8)) {
-            int8_t esc1 = (int8_t)buf[3];
-            int8_t esc2 = (int8_t)buf[4];
-            motor_set_throttle(0, esc1);
-            motor_set_throttle(1, esc2);
+            uint8_t cmd   = buf[2];
+            int8_t  speed = (int8_t)buf[3];
+            int8_t  yaw   = (int8_t)buf[4];
+            uint8_t light = buf[5];
+            uint8_t dir   = buf[6];
+            
+            if (cmd == 0x20) {
+                // 紧急停止
+                motor_set_throttle(0, 0);
+                motor_set_throttle(1, 0);
+                set_light(0);
+                set_motor(0);
+            } else {
+                // 差速混合
+                int16_t left  = clamp(speed + yaw, -100, 100);
+                int16_t right = clamp(speed - yaw, -100, 100);
+                motor_set_throttle(0, left);
+                motor_set_throttle(1, right);
+                set_light(light);
+                set_motor(dir);  // 0停/1正/2反
+            }
         }
     }
     
@@ -304,10 +443,16 @@ while (1) {
 | 2026-01 | Task WDT 退订长 I/O 任务 | 阻塞式 SPI 不适合 5s 默认超时 |
 | 2026-01 | INT GPIO9 + 1ms 去抖 | 防止 INT 抖动反复触发 ISR |
 | 2026-01 | SPI 互斥锁 100ms 超时 | 防止一个任务卡死 SPI 导致所有任务死锁 |
-| 2026-01 | 8B → 16B 控制帧 | 涵盖 4 电调 (本地2+远端2) + L298N + 2 舵机 |
 | 2026-01 | 双 socket 8080+8081 | 主机和远端独立连接, 互不干扰 |
 | 2026-01 | 16B MPU 帧 (6 轴 int16 LE) | 紧凑 (320 字节/秒@20Hz), 上位机解算 |
 | 2026-01 | USB-Serial/JTAG 日志 | 释放 GPIO1 给 ESC1 PWM |
+| **2026-01** | **差速驱动 v4.0: speed+yaw** | **简化协议, 主机发高层指令, ESP32 做开环差速混合** |
+| **2026-01** | **删除舵机 TCP 接收 (字节 8/9)** | **主控制节点舵机不再由上位机控制** |
+| **2026-01** | **新增远端灯+电机信号** | **远端有灯开关和电机方向+停止** |
+| **2026-01** | **L298N 由 speed 自动计算** | **速度用 |speed|, 方向用 sign(speed)** |
+| **2026-01** | **v5.0 新增 RDK X5 UART 通信** | **后续扩展性: 网络摄像头→RDK X5 AI 识别→ESP32 桥接** |
+| **2026-01** | **UART0 GPIO43/44 115200 8N1** | **专用硬件 UART, 与 console 释放解耦** |
+| **2026-01** | **RDK X5 主动模式 (PING/GET_MPU/GET_STATUS)** | **简化 ESP32 逻辑, 资源开销小** |
 
 ---
 
@@ -353,4 +498,4 @@ W5500 ready, MAC=... IP=192.168.29.10
 ---
 
 > 📝 文档变更需同步更新所有相关代码并测试.
->   最后修改: v3.0 (新架构: 主控+远端+上位机, 双 socket, 16B 帧)
+>   最后修改: **v5.0** (新增 RDK X5 UART 通信, 网络摄像头 AI 扩展性预留)
