@@ -1,7 +1,8 @@
-# ESP32-S3 水下机器人 net-manager 项目参数总览
+# ESP32-S3 水上机器人项目参数总览
 
 > 📌 本文档为唯一项目参数权威来源, 所有代码改动须与本文档一致.
-> 文档版本: **v5.0** (新增 RDK X5 UART 通信)
+> 文档版本: **v5.2** (修复主控 IP 覆盖, 移除"已知问题", 与远端节点完全同步)
+> 配套远端文档: [`..\ESP32-S3-below\ESP32-S3水下机器人项目参数总览.md`](../ESP32-S3-below/ESP32-S3水下机器人项目参数总览.md)
 
 ---
 
@@ -172,6 +173,7 @@ remote_dir   = frame[6]  (0=停, 1=正, 2=反)
 | status_led_task | main.c | 5 | 2048 | 150ms | RGB LED 状态指示 |
 | tcp_server_task | main.c | 5 | 8192 | 10ms / 100ms | 双 socket 状态机 (退订 WDT) |
 | mpu_push_task | main.c | 4 | 2048 | 50ms (20Hz) | 读本地 MPU + 推送 (退订 WDT) |
+| rdk_uart_rx_task | rdk_uart.c | 4 | 4096 | 阻塞读 (10ms 超时) | RDK X5 UART 接收 (退订 WDT) |
 | status_report_task | main.c | 4 | 2048 | 500ms (可选) | JSON 状态上报 (当前未启动) |
 
 **所有做阻塞式 SPI 通讯的任务必须调用 `esp_task_wdt_delete(NULL)` 退订 Task WDT**, 改在循环中显式 `esp_task_wdt_reset()` 喂狗.
@@ -213,17 +215,19 @@ remote_dir   = frame[6]  (0=停, 1=正, 2=反)
 |---|---|---|---|
 | SPI 时钟 | **20 MHz** | wiznet_manager.c | SPI_DMA_DISABLED (polling) 模式, 无堆碎片 |
 | DMA 模式 | **DISABLED** | wiznet_manager.c | ESP-IDF v5.5 DMA 模式反复 malloc 会触发 Task WDT |
-| INT GPIO | **GPIO9** | wiznet.c | 下降沿触发, ISR 置位 + 1ms 去抖 |
-| INT 去抖 | 1ms | wiznet_spi.c | 防止 INT 抖动反复触发 ISR |
+| INT GPIO | **GPIO9** | wiznet.c | 下降沿触发, ISR 置位 + <1ms 去抖 |
+| INT 去抖 | < 1ms | wiznet_spi.c | 防止 INT 抖动反复触发 ISR (`s_last_isr_us < 1000` 即 <1000µs) |
 | PHY 模式 | 100M FULL | wiznet_manager.c | 软件强制 (可改自动协商) |
 | SPI 互斥锁超时 | 100ms | wiznet_spi.c | 防止死锁 |
-| 默认 IP | 192.168.29.10 | wiznet_manager.c | 静态 |
+| 默认 IP | 192.168.29.10 | main.c | 静态, **main.c 显式覆盖了 wiznet_manager_get_default_config() 的 192.168.1.100**; 远端节点 connect `.10:8081` |
 | 子网掩码 | 255.255.255.0 | wiznet_manager.c | /24 |
-| 默认网关 | 192.168.29.1 | wiznet_manager.c | 路由器 |
+| 默认网关 | 192.168.29.1 | main.c | 路由器, main.c 显式覆盖了 wiznet_manager_get_default_config() 的 192.168.1.1 |
 | DNS | 8.8.8.8 | wiznet_manager.c | 公共 DNS |
 | 等待 link up 超时 | 30s | main.c | 启动时阻塞等待 |
 | socket 数量 | 8 | wiznet_manager.c | W5500 8 个 socket |
-| socket 缓冲 | 2KB/2KB (TX/RX) | wiznet_manager.c | 共 32KB, W5500 内部 SRAM |
+| socket 缓冲 | 2KB/2KB (TX/RX) | wiznet_manager.c | 8 sockets 各 2KB TX + 各 2KB RX, TX 共 16KB + RX 共 16KB, 共用 W5500 内部 32KB SRAM |
+
+> ✅ **v5.2 修复**: main.c 现在显式覆盖 `wiznet_manager_get_default_config()` 的 IP 为 `192.168.29.10`、网关为 `192.168.29.1`, 与远端节点 `.11` 同 /24 网段, 远端 TCP Client 可正常连接.
 
 ---
 
@@ -274,9 +278,8 @@ void   control_set_forward_callback(ctrl_forward_cb_t cb);
 
 /* 帧构造器 (上位机和远端节点开发用) */
 void control_build_ctrl_frame(uint8_t *frame, uint8_t cmd,
-    int8_t local_esc1, int8_t local_esc2,
-    int8_t remote_esc1, int8_t remote_esc2,
-    uint8_t dc_packed, uint8_t servo0, uint8_t servo1, uint8_t flags);
+    int8_t speed, int8_t yaw,
+    uint8_t remote_light, uint8_t remote_dir, uint8_t flags);
 
 void control_build_mpu_frame(uint8_t *frame, uint8_t type,
     int16_t ax, int16_t ay, int16_t az,
@@ -284,6 +287,30 @@ void control_build_mpu_frame(uint8_t *frame, uint8_t type,
 
 /* 统计 */
 uint32_t control_get_frame_count(void);
+```
+
+### 8.3 常量定义
+
+```c
+#define CTRL_CTRL_HEAD_0       0xAA
+#define CTRL_CTRL_HEAD_1       0x55
+#define CTRL_CTRL_FRAME_SIZE   16
+#define CTRL_FWD_FRAME_SIZE    8
+
+#define CTRL_MPU_HEAD_0        0xBB
+#define CTRL_MPU_HEAD_1        0x66
+#define CTRL_MPU_FRAME_SIZE    16
+
+#define CTRL_CMD_MOTOR         0x10
+#define CTRL_CMD_STOP          0x20
+#define CTRL_CMD_REBOOT        0x30
+#define CTRL_CMD_SHUTDOWN      0x40
+
+#define CTRL_MPU_TYPE_LOCAL    0x01
+#define CTRL_MPU_TYPE_REMOTE   0x02
+
+#define CTRL_FLAG_ENABLE_LOCAL   0x01
+#define CTRL_FLAG_FORWARD_REMOTE 0x02
 ```
 
 ## 9. RDK X5 UART 通信 (v5.0 新增)
@@ -453,6 +480,8 @@ while (1) {
 | **2026-01** | **v5.0 新增 RDK X5 UART 通信** | **后续扩展性: 网络摄像头→RDK X5 AI 识别→ESP32 桥接** |
 | **2026-01** | **UART0 GPIO43/44 115200 8N1** | **专用硬件 UART, 与 console 释放解耦** |
 | **2026-01** | **RDK X5 主动模式 (PING/GET_MPU/GET_STATUS)** | **简化 ESP32 逻辑, 资源开销小** |
+| **2026-07** | **v5.1 文档校对** | **标题修正 (水上/水下), W5500 默认 IP 标注, rdk_uart_rx_task 补入任务清单, INT 去抖描述统一** |
+| **2026-07** | **v5.2 修复主控 IP** | **main.c 显式覆盖 wiznet_manager_get_default_config() 的 IP 为 192.168.29.10, 网关为 192.168.29.1, 与远端节点 .11 同 /24 网段** |
 
 ---
 
@@ -498,4 +527,4 @@ W5500 ready, MAC=... IP=192.168.29.10
 ---
 
 > 📝 文档变更需同步更新所有相关代码并测试.
->   最后修改: **v5.0** (新增 RDK X5 UART 通信, 网络摄像头 AI 扩展性预留)
+>   最后修改: **v5.2** (修复主控 IP 覆盖 192.168.29.10, 移除"已知问题", 与远端节点完全同步)

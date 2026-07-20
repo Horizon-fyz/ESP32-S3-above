@@ -334,6 +334,12 @@ static void start_components(void)
 
     /* 3. W5500 (必须在 LED/控制 task 之前初始化) */
     wiznet_manager_config_t wcfg = wiznet_manager_get_default_config();
+    /* 覆盖默认 IP 为项目约定值 192.168.29.10 (与远端节点 .11 同 /24 网段,
+     * 远端 TCP Client connect 192.168.29.10:8081).
+     * 默认 config 返回 192.168.1.100, 与本项目网段不符, 必须在 main.c 显式覆盖. */
+    wcfg.ip[0]      = 192; wcfg.ip[1]      = 168; wcfg.ip[2]      = 29; wcfg.ip[3]      = 10;
+    wcfg.gateway[0] = 192; wcfg.gateway[1] = 168; wcfg.gateway[2] = 29; wcfg.gateway[3] = 1;
+    /* DNS 沿用默认 8.8.8.8 */
     /* 8 socket 缓冲 (RX+TX 各 2KB, 共 32KB) - W5500 内部 16KB/32KB/48KB 选型 */
     /* 注: 默认配置已设为 2KB per socket, 8 个 socket 共用 32KB W5500 SRAM */
     ESP_ERROR_CHECK(wiznet_manager_init(&wcfg));
@@ -384,14 +390,10 @@ static void start_components(void)
         ESP_LOGW(TAG, "=== 网线未连接 (30s 超时) ===");
     }
 
-    /* 8. 日志降噪 (默认全开, 这里只保留必要 tag) */
-    esp_log_level_set("*", ESP_LOG_NONE);
-    esp_log_level_set("APP",      ESP_LOG_INFO);
-    esp_log_level_set("wiznet_mgr", ESP_LOG_INFO);
-    esp_log_level_set("wiznet_spi", ESP_LOG_INFO);
-    esp_log_level_set("TCP",        ESP_LOG_INFO);
-    esp_log_level_set("control",    ESP_LOG_INFO);
-    esp_log_level_set("rdk_uart",   ESP_LOG_INFO);
+    /* 8. 日志降噪 (默认开 INFO, 但关闭驱动内不必要 tag) */
+    esp_log_level_set("wifi",       ESP_LOG_WARN);
+    esp_log_level_set("spi_master", ESP_LOG_WARN);
+    esp_log_level_set("gpio",       ESP_LOG_WARN);
 
     /* 9. 创建任务 */
     xTaskCreate(status_led_task,    "led",     2048, NULL, 5, NULL);

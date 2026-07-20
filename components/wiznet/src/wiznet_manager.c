@@ -42,9 +42,9 @@ wiznet_manager_config_t wiznet_manager_get_default_config(void)
     cfg.spi_clock_hz = 20 * 1000 * 1000;   /* 20 MHz (polling 模式) */
 
     /* 默认静态 IP, 主流路由器网段 */
-    cfg.ip[0]      = 192; cfg.ip[1]      = 168; cfg.ip[2]      = 1;    cfg.ip[3]      = 100;
+    cfg.ip[0]      = 192; cfg.ip[1]      = 168; cfg.ip[2]      = 29;   cfg.ip[3]      = 10;
     cfg.netmask[0] = 255; cfg.netmask[1] = 255; cfg.netmask[2] = 255;  cfg.netmask[3] = 0;
-    cfg.gateway[0] = 192; cfg.gateway[1] = 168; cfg.gateway[2] = 1;    cfg.gateway[3] = 1;
+    cfg.gateway[0] = 192; cfg.gateway[1] = 168; cfg.gateway[2] = 29;   cfg.gateway[3] = 1;
     cfg.dns[0]     = 8;   cfg.dns[1]     = 8;   cfg.dns[2]     = 8;    cfg.dns[3]     = 8;
 
     /* 8 socket 共享 16KB SRAM, 各 2KB (默认配置) */
@@ -146,12 +146,16 @@ esp_err_t wiznet_manager_init(const wiznet_manager_config_t *cfg)
     }
     wizchip_setnetinfo(&s_net_info);
 
-    /* 5. 配置 PHY: 100M FULL (按项目参数文档) */
+    /* 5. 配置 PHY: 使用自动协商 (10/100M 自适应)
+     *
+     * 注意: W5500 PHY 不支持强制 100M FULL 配置.
+     * 只能配 PHY_MODE_AUTONEGO 让 PHY 自动协商 10/100M.
+     * (W5500 datasheet §3.2, §4.4) */
     wiz_PhyConf phyconf = {
-        .by  = PHY_CONFBY_SW,
-        .mode = PHY_MODE_MANUAL,
-        .speed = PHY_SPEED_100,
-        .duplex = PHY_DUPLEX_FULL,
+        .by     = PHY_CONFBY_SW,
+        .mode   = PHY_MODE_AUTONEGO,
+        .speed  = PHY_SPEED_100,   /* autonego 时, 100 是 preferred, 不强制 */
+        .duplex = PHY_DUPLEX_FULL, /* autonego 时, FULL 是 preferred, 不强制 */
     };
     wizphy_setphyconf(&phyconf);
     vTaskDelay(pdMS_TO_TICKS(50));

@@ -4,4 +4,4 @@ cmake_minimum_required(VERSION 3.16)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 set(EXTRA_COMPONENT_DIRS components)
-project(ESP32-S3-net-manager)
+project(ESP32-S3-above)

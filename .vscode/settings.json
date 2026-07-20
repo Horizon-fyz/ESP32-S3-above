@@ -4,8 +4,8 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM11",
-  "idf.currentSetup": "/home/user/.espressif/v5.5.4/esp-idf",
+  "idf.portWin": "COM8",
+  "idf.currentSetup": "F:\\.espressif\\v5.5.4\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
@@ -13,8 +13,9 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=c:\\Users\\2gck 51\\Desktop\\ESP32-S3-net-manager\\build"
+    "--compile-commands-dir=g:\\zhishiqinglan4\\ESP32-S3-above\\build"
   ],
   "idf.flashType": "UART",
-  "idf.port": "/dev/ttyACM0"
+  "idf.port": "/dev/ttyACM0",
+  "idf.pythonInstallPath": "C:\\Espressif\\tools\\python\\v5.5.4\\venv\\Scripts\\python.exe"
 }
