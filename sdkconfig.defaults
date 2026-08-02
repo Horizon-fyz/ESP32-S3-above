@@ -1,2 +1,6 @@
 # Enable DHCP ARP check to detect IP address conflicts on the network
 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=y
+
+# 释放 UART0 (GPIO1/3) 给 ESC1 PWM / RDK X5 UART,
+# 日志通过 USB-Serial/JTAG 输出
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

@@ -60,7 +60,8 @@ typedef struct {
  *
  * 适用于 ESP32-S3 + W5500 (SPI2) 通用接线:
  *   SCK=12, MOSI=11, MISO=13, CS=10, RST=-1, INT=-1
- *   IP: 192.168.1.100, MASK: 255.255.255.0, GW: 192.168.1.1
+ *   默认: IP 192.168.1.100, MASK 255.255.255.0, GW 192.168.1.1
+ *   本工程 main.c 会覆盖为: IP 192.168.29.10, GW 192.168.29.1
  */
 wiznet_manager_config_t wiznet_manager_get_default_config(void);
 

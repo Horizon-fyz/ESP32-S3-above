@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -40,7 +41,6 @@
 #include "wiznet_manager.h"
 #include "wiznet_spi.h"
 #include "status_led.h"
-#include "tcp_parser.h"
 #include "motor.h"
 #include "imu.h"
 #include "servo.h"
@@ -57,7 +57,7 @@
 #define MPU_FRAME_SIZE    16
 
 /* 硬件引脚定义 */
-#define RGB_LED_GPIO      48      /* 板载 RGB LED (WS2812) */
+#define RGB_LED_GPIO      48      /* 板载 WS2812B RGB LED, GPIO48 */
 
 static uint8_t s_rx_buffer[RX_BUFFER_SIZE];
 static uint8_t s_tx_buffer[TX_BUFFER_SIZE];
@@ -66,8 +66,8 @@ static uint8_t s_mpu_frame[MPU_FRAME_SIZE];
 static const char *TAG = "APP";
 
 /* ========== 连接状态 ========== */
-static volatile bool s_host_connected   = false;
-static volatile bool s_remote_connected = false;
+static atomic_bool s_host_connected   = ATOMIC_VAR_INIT(false);
+static atomic_bool s_remote_connected = ATOMIC_VAR_INIT(false);
 
 /* ========== 任务句柄 ========== */
 static TaskHandle_t s_mpu_push_task_handle = NULL;
@@ -79,11 +79,24 @@ static TaskHandle_t s_status_report_task_handle = NULL;
  *
  * 收到上位机 16B 控制帧后, 若 flags bit1 置位, 主节点构造 8B 子帧
  * 通过 socket 1 发给远端. 8B 子帧携带 speed+yaw+light+dir, 远端
- * 自行做差速混合. */
+ * 自行做差速混合. v2.0: cmd=0x11 DEPTH 时构造深度子帧 (目标深度 cm + 模式). */
 static void forward_to_remote(const ctrl_command_t *cmd)
 {
-    if (!s_remote_connected) {
+    if (!atomic_load(&s_remote_connected)) {
         ESP_LOGW("control", "远程未连接, 转发丢弃");
+        return;
+    }
+
+    if (cmd->cmd == CTRL_CMD_DEPTH) {
+        /* v2.0 深度控制子帧: AA 55 0x11 depth_cm(LE) mode 0 CRC */
+        uint8_t fwd[CTRL_FWD_FRAME_SIZE];
+        control_build_depth_fwd_frame(fwd, cmd->target_depth_cm, cmd->depth_mode);
+        int32_t sent = wiz_send(REMOTE_SOCK, fwd, CTRL_FWD_FRAME_SIZE);
+        if (sent == CTRL_FWD_FRAME_SIZE) {
+            status_led_notify_tx((uint32_t)sent);
+        } else {
+            ESP_LOGW("control", "转发深度到远端失败: %d", (int)sent);
+        }
         return;
     }
 
@@ -101,7 +114,9 @@ static void forward_to_remote(const ctrl_command_t *cmd)
     fwd[7] = crc;
 
     int32_t sent = wiz_send(REMOTE_SOCK, fwd, CTRL_FWD_FRAME_SIZE);
-    if (sent != CTRL_FWD_FRAME_SIZE) {
+    if (sent == CTRL_FWD_FRAME_SIZE) {
+        status_led_notify_tx((uint32_t)sent);
+    } else {
         ESP_LOGW("control", "转发到远端失败: %d", (int)sent);
     }
 }
@@ -109,11 +124,13 @@ static void forward_to_remote(const ctrl_command_t *cmd)
 /* MPU 数据推送到上位机 (由 control 模块通过 handle_mpu_frame 调用) */
 void tcp_server_forward_mpu_to_host(const ctrl_mpu_data_t *m)
 {
-    if (!s_host_connected) return;
+    if (!atomic_load(&s_host_connected)) return;
     control_build_mpu_frame(s_mpu_frame, m->type,
                             m->ax, m->ay, m->az, m->gx, m->gy, m->gz);
     int32_t sent = wiz_send(HOST_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
-    if (sent != MPU_FRAME_SIZE) {
+    if (sent == MPU_FRAME_SIZE) {
+        status_led_notify_tx((uint32_t)sent);
+    } else {
         ESP_LOGW("control", "MPU 推上位机失败: %d", (int)sent);
     }
 }
@@ -122,9 +139,12 @@ void tcp_server_forward_mpu_to_host(const ctrl_mpu_data_t *m)
 static void push_mpu_to_remote(uint8_t type, int16_t ax, int16_t ay, int16_t az,
                                 int16_t gx, int16_t gy, int16_t gz)
 {
-    if (!s_remote_connected) return;
+    if (!atomic_load(&s_remote_connected)) return;
     control_build_mpu_frame(s_mpu_frame, type, ax, ay, az, gx, gy, gz);
-    wiz_send(REMOTE_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
+    int32_t sent = wiz_send(REMOTE_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
+    if (sent == MPU_FRAME_SIZE) {
+        status_led_notify_tx((uint32_t)sent);
+    }
 }
 
 /* ========== 任务实现 ========== */
@@ -141,7 +161,7 @@ static void status_led_task(void *pvParameters)
 
 /* 通用 socket 处理: listen -> 接收 -> 解析 -> 关闭重建 */
 static void handle_socket(uint8_t sock, const char *name,
-                          bool *connected_flag, void (*on_connect)(void))
+                          atomic_bool *connected_flag, void (*on_connect)(void))
 {
     uint8_t sr = getSn_SR(sock);
     int32_t n;
@@ -274,10 +294,13 @@ static void mpu_push_task(void *pvParameters)
             int16_t gz = (int16_t)(m.gz * 131.0f);
 
             /* 推上位机 (type=LOCAL) */
-            if (s_host_connected) {
+            if (atomic_load(&s_host_connected)) {
                 control_build_mpu_frame(s_mpu_frame, CTRL_MPU_TYPE_LOCAL,
                                         ax, ay, az, gx, gy, gz);
-                wiz_send(HOST_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
+                int32_t sent = wiz_send(HOST_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
+                if (sent == MPU_FRAME_SIZE) {
+                    status_led_notify_tx((uint32_t)sent);
+                }
             }
             /* 推远端 (type=LOCAL, 远端知道是主节点发的) */
             push_mpu_to_remote(CTRL_MPU_TYPE_LOCAL, ax, ay, az, gx, gy, gz);
@@ -300,17 +323,20 @@ static void status_report_task(void *pvParameters)
         esp_task_wdt_reset();
         vTaskDelayUntil(&last_wake, period);
 
-        if (!s_host_connected) continue;
+        if (!atomic_load(&s_host_connected)) continue;
 
         /* 简化的状态: 实际可由 cJSON 构造, 此处先输出最少信息 */
         int n = snprintf((char *)s_tx_buffer, sizeof(s_tx_buffer),
                          "{\"uptime_ms\":%lld,\"link\":true,\"host\":%d,\"remote\":%d,\"frames\":%lu}\n",
                          (long long)(esp_timer_get_time() / 1000),
-                         s_host_connected ? 1 : 0,
-                         s_remote_connected ? 1 : 0,
+                         atomic_load(&s_host_connected) ? 1 : 0,
+                         atomic_load(&s_remote_connected) ? 1 : 0,
                          (unsigned long)control_get_frame_count());
         if (n > 0) {
-            wiz_send(HOST_SOCK, s_tx_buffer, (uint16_t)n);
+            int32_t sent = wiz_send(HOST_SOCK, s_tx_buffer, (uint16_t)n);
+            if (sent == n) {
+                status_led_notify_tx((uint32_t)sent);
+            }
         }
     }
 }
@@ -330,7 +356,10 @@ static void start_components(void)
     ESP_ERROR_CHECK(ret);
 
     /* 2. 状态 LED */
-    ESP_ERROR_CHECK(status_led_init(RGB_LED_GPIO));
+    status_led_config_t led_cfg = status_led_get_default_config();
+    led_cfg.gpio_num = RGB_LED_GPIO;  /* WS2812B 数据脚, 固定 GPIO48 */
+    led_cfg.brightness = 64;          /* 0-255, 数值越大越亮 */
+    ESP_ERROR_CHECK(status_led_init(&led_cfg));
 
     /* 3. W5500 (必须在 LED/控制 task 之前初始化) */
     wiznet_manager_config_t wcfg = wiznet_manager_get_default_config();

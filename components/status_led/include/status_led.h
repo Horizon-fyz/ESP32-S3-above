@@ -2,18 +2,40 @@
  * @file status_led.h
  * @brief 网络状态指示灯模块
  *
- * 使用ESP32-S3-DevKitC-1板载RGB LED (WS2812, GPIO48)
- * 显示网络连接状态和数据交换状态。
+ * 使用单颗板载 WS2812B RGB LED (GPIO48), 通过 RMT 单总线驱动。
+ * 硬件参数:
+ *   - LED 型号: XL-5050RGBC-WS2812B (5V)
+ *   - 数据引脚: GPIO48
+ *   - 像素数量: 1
+ *   - 灯序: GRB
+ *   - DO 悬空, 无级联
  */
 
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * @brief 指示灯颜色
+ */
+typedef enum {
+    LED_COLOR_OFF = 0,
+    LED_COLOR_RED,
+    LED_COLOR_GREEN,
+    LED_COLOR_BLUE,          /* 深蓝 */
+    LED_COLOR_YELLOW,        /* 深黄 */
+    LED_COLOR_YELLOW_DIM,    /* 浅黄 */
+    LED_COLOR_PURPLE,
+    LED_COLOR_BLUE_DIM,      /* 浅蓝 */
+    LED_COLOR_WHITE,
+    LED_COLOR_MAX
+} led_color_t;
 
 /**
  * @brief 指示灯状态
@@ -25,12 +47,34 @@ typedef enum {
 } status_led_state_t;
 
 /**
+ * @brief WS2812B 配置
+ */
+typedef struct {
+    int gpio_num;        ///< WS2812B 数据引脚, 默认 GPIO48
+    uint8_t brightness;  ///< 全局亮度 0-255, 默认 64
+} status_led_config_t;
+
+/**
+ * @brief 获取默认配置
+ *
+ * 默认: GPIO48, 亮度 64。
+ */
+status_led_config_t status_led_get_default_config(void);
+
+/**
  * @brief 初始化状态指示灯
  *
- * @param gpio_num RGB LED引脚号，ESP32-S3-DevKitC-1为GPIO48
+ * @param cfg WS2812B 配置
  * @return esp_err_t ESP_OK成功，其他失败
  */
-esp_err_t status_led_init(int gpio_num);
+esp_err_t status_led_init(const status_led_config_t *cfg);
+
+/**
+ * @brief 设置指示灯颜色
+ *
+ * @param color 颜色枚举
+ */
+void status_led_set_color(led_color_t color);
 
 /**
  * @brief 设置指示灯状态

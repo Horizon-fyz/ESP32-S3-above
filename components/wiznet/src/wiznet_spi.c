@@ -38,6 +38,7 @@ static int                 s_cs_gpio     = -1;
 static int                 s_rst_gpio    = -1;
 static int                 s_int_gpio    = -1;
 static SemaphoreHandle_t   s_cs_mutex    = NULL;   /* 保护 W5500 互斥访问 */
+static int                 s_cs_depth    = 0;      /* 递归互斥锁嵌套深度 */
 
 /* INT 中断事件: W5500 拉低 INT → ISR 置位 → 任务检测后处理
  * 不用事件队列 (避免多任务同步复杂性), 直接用 volatile + ISR 标志 */
@@ -66,7 +67,9 @@ static void wiznet_cris_enter(void)
     if (s_cs_mutex) {
         /* 用 100ms 超时而不是 portMAX_DELAY, 防止其他任务卡死 SPI
          * 时本任务永远等待. 超时则放弃本次操作, 由调用方处理. */
-        if (xSemaphoreTakeRecursive(s_cs_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        if (xSemaphoreTakeRecursive(s_cs_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            s_cs_depth++;
+        } else {
             ESP_LOGE(TAG, "CS mutex timeout (100ms) - another task stuck in SPI");
         }
     }
@@ -74,7 +77,8 @@ static void wiznet_cris_enter(void)
 
 static void wiznet_cris_exit(void)
 {
-    if (s_cs_mutex) {
+    if (s_cs_mutex && s_cs_depth > 0) {
+        s_cs_depth--;
         xSemaphoreGiveRecursive(s_cs_mutex);
     }
 }

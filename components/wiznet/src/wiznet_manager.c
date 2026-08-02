@@ -146,16 +146,15 @@ esp_err_t wiznet_manager_init(const wiznet_manager_config_t *cfg)
     }
     wizchip_setnetinfo(&s_net_info);
 
-    /* 5. 配置 PHY: 使用自动协商 (10/100M 自适应)
+    /* 5. 配置 PHY: 软件强制 100M FULL
      *
-     * 注意: W5500 PHY 不支持强制 100M FULL 配置.
-     * 只能配 PHY_MODE_AUTONEGO 让 PHY 自动协商 10/100M.
-     * (W5500 datasheet §3.2, §4.4) */
+     * 与项目参数文档一致 (PHY 模式 = 100M FULL).
+     * 通过 PHYCR 寄存器直接设置, 无需 MDC/MDIO. */
     wiz_PhyConf phyconf = {
         .by     = PHY_CONFBY_SW,
-        .mode   = PHY_MODE_AUTONEGO,
-        .speed  = PHY_SPEED_100,   /* autonego 时, 100 是 preferred, 不强制 */
-        .duplex = PHY_DUPLEX_FULL, /* autonego 时, FULL 是 preferred, 不强制 */
+        .mode   = PHY_MODE_MANUAL,
+        .speed  = PHY_SPEED_100,
+        .duplex = PHY_DUPLEX_FULL,
     };
     wizphy_setphyconf(&phyconf);
     vTaskDelay(pdMS_TO_TICKS(50));
