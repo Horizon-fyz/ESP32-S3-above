@@ -27,6 +27,8 @@ typedef enum {
     MOTOR_ESC_1 = 0,    ///< 测试电调 1 (PWM: GPIO1,  ⚠️ 占用 U0TXD, 需 USB-Serial/JTAG 日志)
     MOTOR_ESC_2,        ///< 测试电调 2 (PWM: GPIO42, MTMS, 可用)
     MOTOR_MAIN_DC,      ///< 主推进直流电机 (L298N: ENA+IN1+IN2)
+    MOTOR_THRUST_REV_1, ///< 反推电调 1 (PWM: GPIO2)
+    MOTOR_THRUST_REV_2, ///< 反推电调 2 (PWM: GPIO3)
     MOTOR_MAX,
 } motor_id_t;
 
@@ -62,6 +64,18 @@ typedef struct {
     uint32_t dc_pwm_freq_hz;   ///< 调速频率 (1kHz~25kHz, 常用 5kHz)
     uint8_t  dc_ledc_timer;
     uint8_t  dc_ledc_channel;
+
+    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO2 */
+    int      rev1_gpio;         ///< 反推电调 1 PWM 引脚 (-1=未使用)
+    uint32_t rev1_freq_hz;      ///< 反推电调 1 频率 (典型 50Hz)
+    uint8_t  rev1_ledc_timer;
+    uint8_t  rev1_ledc_channel;
+
+    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO3 */
+    int      rev2_gpio;         ///< 反推电调 2 PWM 引脚 (-1=未使用)
+    uint32_t rev2_freq_hz;      ///< 反推电调 2 频率 (典型 50Hz)
+    uint8_t  rev2_ledc_timer;
+    uint8_t  rev2_ledc_channel;
 } motor_config_t;
 
 /**

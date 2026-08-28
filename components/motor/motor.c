@@ -1,11 +1,13 @@
 /**
  * @file motor.c
- * @brief 电机控制实现 (2 路电调 + 1 路 L298N)
+ * @brief 电机控制实现 (4 路电调 + 1 路 L298N)
  *
  * LEDC 通道分配 (避免冲突):
- *   ESC1: Timer0, Channel0
- *   ESC2: Timer0, Channel1  (同 Timer 不同 Channel, 频率必须一致)
- *   DC  : Timer1, Channel0
+ *   ESC1    : Timer0, Channel0  (GPIO1)
+ *   ESC2    : Timer0, Channel1  (GPIO42)
+ *   REV ESC1: Timer0, Channel2  (GPIO2, 反推)
+ *   REV ESC2: Timer0, Channel3  (GPIO3, 反推)
+ *   DC      : Timer1, Channel0  (GPIO16)
  *
  * 电调 PWM 协议 (50Hz, 20ms 周期, 13 位分辨率):
  *   1.0ms (反向最大) ~ 1.5ms (中位) ~ 2.0ms (正向最大)
@@ -27,9 +29,8 @@
 static const char *TAG = "motor";
 
 /* 内部状态: 每个电机是否已配置 */
-static bool            s_esc1_configured = false;
-static bool            s_esc2_configured = false;
 static bool            s_dc_configured   = false;
+static bool            s_channel_configured[MOTOR_MAX] = {false};
 static motor_config_t  s_cfg;
 
 /* 电调 → LEDC 通道映射 (运行时确定, 用于 set_duty) */
@@ -102,6 +103,20 @@ motor_config_t motor_get_default_config(void)
     cfg.dc_ledc_timer    = LEDC_TIMER_1;
     cfg.dc_ledc_channel  = LEDC_CHANNEL_0;
 
+    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO2
+     * 与 ESC1/ESC2 共享 Timer0 (50Hz), 使用 Channel2 */
+    cfg.rev1_gpio         = 2;
+    cfg.rev1_freq_hz      = 50;
+    cfg.rev1_ledc_timer   = LEDC_TIMER_0;
+    cfg.rev1_ledc_channel = LEDC_CHANNEL_2;
+
+    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO3
+     * 与 ESC1/ESC2 共享 Timer0 (50Hz), 使用 Channel3 */
+    cfg.rev2_gpio         = 3;
+    cfg.rev2_freq_hz      = 50;
+    cfg.rev2_ledc_timer   = LEDC_TIMER_0;
+    cfg.rev2_ledc_channel = LEDC_CHANNEL_3;
+
     return cfg;
 }
 
@@ -117,7 +132,7 @@ esp_err_t motor_init(const motor_config_t *cfg)
         esp_err_t ret = ledc_setup_channel(cfg->esc1_ledc_timer, cfg->esc1_ledc_channel,
                                             cfg->esc1_gpio, cfg->esc1_freq_hz, LEDC_LOW_SPEED_MODE);
         if (ret != ESP_OK) return ret;
-        s_esc1_configured = true;
+        s_channel_configured[MOTOR_ESC_1] = true;
         s_esc_map[MOTOR_ESC_1] = (esc_ledc_map_t){ LEDC_LOW_SPEED_MODE, cfg->esc1_ledc_channel };
         ESP_LOGW(TAG, "ESC1 enabled on GPIO%d (U0TXD, log via USB-Serial/JTAG required)",
                  cfg->esc1_gpio);
@@ -135,10 +150,32 @@ esp_err_t motor_init(const motor_config_t *cfg)
         esp_err_t ret = ledc_setup_channel(cfg->esc2_ledc_timer, cfg->esc2_ledc_channel,
                                             cfg->esc2_gpio, cfg->esc2_freq_hz, LEDC_LOW_SPEED_MODE);
         if (ret != ESP_OK) return ret;
-        s_esc2_configured = true;
+        s_channel_configured[MOTOR_ESC_2] = true;
         s_esc_map[MOTOR_ESC_2] = (esc_ledc_map_t){ LEDC_LOW_SPEED_MODE, cfg->esc2_ledc_channel };
         ESP_LOGI(TAG, "ESC2 enabled on GPIO%d (timer=%d, ch=%d)",
                  cfg->esc2_gpio, cfg->esc2_ledc_timer, cfg->esc2_ledc_channel);
+    }
+
+    /* 反推电调 1 - GPIO2 */
+    if (cfg->rev1_gpio >= 0) {
+        esp_err_t ret = ledc_setup_channel(cfg->rev1_ledc_timer, cfg->rev1_ledc_channel,
+                                            cfg->rev1_gpio, cfg->rev1_freq_hz, LEDC_LOW_SPEED_MODE);
+        if (ret != ESP_OK) return ret;
+        s_channel_configured[MOTOR_THRUST_REV_1] = true;
+        s_esc_map[MOTOR_THRUST_REV_1] = (esc_ledc_map_t){ LEDC_LOW_SPEED_MODE, cfg->rev1_ledc_channel };
+        ESP_LOGI(TAG, "REV ESC1 enabled on GPIO%d (timer=%d, ch=%d)",
+                 cfg->rev1_gpio, cfg->rev1_ledc_timer, cfg->rev1_ledc_channel);
+    }
+
+    /* 反推电调 2 - GPIO3 */
+    if (cfg->rev2_gpio >= 0) {
+        esp_err_t ret = ledc_setup_channel(cfg->rev2_ledc_timer, cfg->rev2_ledc_channel,
+                                            cfg->rev2_gpio, cfg->rev2_freq_hz, LEDC_LOW_SPEED_MODE);
+        if (ret != ESP_OK) return ret;
+        s_channel_configured[MOTOR_THRUST_REV_2] = true;
+        s_esc_map[MOTOR_THRUST_REV_2] = (esc_ledc_map_t){ LEDC_LOW_SPEED_MODE, cfg->rev2_ledc_channel };
+        ESP_LOGI(TAG, "REV ESC2 enabled on GPIO%d (timer=%d, ch=%d)",
+                 cfg->rev2_gpio, cfg->rev2_ledc_timer, cfg->rev2_ledc_channel);
     }
 
     /* L298N 直流电机 - ENA 调速 + IN1/IN2 方向 */
@@ -176,12 +213,10 @@ esp_err_t motor_init(const motor_config_t *cfg)
 
 esp_err_t motor_set_esc_throttle(motor_id_t id, float throttle)
 {
-    if (id >= MOTOR_MAX) {
-        return ESP_ERR_INVALID_ARG;
+    if (id >= MOTOR_MAX || id == MOTOR_MAIN_DC) {
+        return ESP_ERR_INVALID_ARG;  /* DC 用 set_dc_speed */
     }
-    if (id == MOTOR_ESC_1 && !s_esc1_configured) return ESP_ERR_INVALID_STATE;
-    if (id == MOTOR_ESC_2 && !s_esc2_configured) return ESP_ERR_INVALID_STATE;
-    if (id == MOTOR_MAIN_DC) return ESP_ERR_INVALID_ARG;  /* DC 用 set_dc_speed */
+    if (!s_channel_configured[id]) return ESP_ERR_INVALID_STATE;
 
     if (throttle >  100.0f) throttle =  100.0f;
     if (throttle < -100.0f) throttle = -100.0f;
@@ -241,22 +276,20 @@ esp_err_t motor_set_dc_speed(motor_id_t id, float speed, motor_dir_t dir)
 void motor_emergency_stop(void)
 {
     /* 全部电调停止 */
-    if (s_esc1_configured) {
-        motor_set_esc_throttle(MOTOR_ESC_1, 0);
-    }
-    if (s_esc2_configured) {
-        motor_set_esc_throttle(MOTOR_ESC_2, 0);
-    }
-    /* L298N 停止 */
-    if (s_dc_configured) {
-        motor_set_dc_speed(MOTOR_MAIN_DC, 0, MOTOR_DIR_STOP);
+    for (int i = 0; i < MOTOR_MAX; i++) {
+        if (i == MOTOR_MAIN_DC) {
+            if (s_dc_configured) {
+                motor_set_dc_speed(MOTOR_MAIN_DC, 0, MOTOR_DIR_STOP);
+            }
+        } else if (s_channel_configured[i]) {
+            motor_set_esc_throttle((motor_id_t)i, 0);
+        }
     }
 }
 
 void motor_deinit(void)
 {
     motor_emergency_stop();
-    s_esc1_configured = false;
-    s_esc2_configured = false;
-    s_dc_configured   = false;
+    memset(s_channel_configured, 0, sizeof(s_channel_configured));
+    s_dc_configured = false;
 }
