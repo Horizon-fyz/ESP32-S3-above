@@ -78,8 +78,8 @@ static TaskHandle_t s_status_report_task_handle = NULL;
 /* 主 → 远端 转发 (由 control 模块通过回调调用)
  *
  * 收到上位机 16B 控制帧后, 若 flags bit1 置位, 主节点构造 8B 子帧
- * 通过 socket 1 发给远端. 8B 子帧携带 speed+yaw+light+dir, 远端
- * 自行做差速混合. v2.0: cmd=0x11 DEPTH 时构造深度子帧 (目标深度 cm + 模式). */
+ * 通过 socket 1 发给远端. 8B 子帧携带 speed+yaw+light+bucket_speed, 远端
+ * 自行做差速混合并驱动 L298N 铲斗电机. v2.0: cmd=0x11 DEPTH 时构造深度子帧 (目标深度 cm + 模式). */
 static void forward_to_remote(const ctrl_command_t *cmd)
 {
     if (!atomic_load(&s_remote_connected)) {
@@ -100,7 +100,7 @@ static void forward_to_remote(const ctrl_command_t *cmd)
         return;
     }
 
-    /* 构造 8B 子帧: AA 55 cmd speed yaw remote_light remote_dir CRC */
+    /* 构造 8B 子帧: AA 55 cmd speed yaw remote_light bucket_speed CRC */
     uint8_t fwd[CTRL_FWD_FRAME_SIZE];
     fwd[0] = CTRL_CTRL_HEAD_0;
     fwd[1] = CTRL_CTRL_HEAD_1;
@@ -108,7 +108,7 @@ static void forward_to_remote(const ctrl_command_t *cmd)
     fwd[3] = (uint8_t)cmd->speed;
     fwd[4] = (uint8_t)cmd->yaw;
     fwd[5] = cmd->remote_light;
-    fwd[6] = cmd->remote_dir;
+    fwd[6] = (uint8_t)cmd->bucket_speed;
     uint8_t crc = 0;
     for (int i = 0; i < 7; i++) crc ^= fwd[i];
     fwd[7] = crc;

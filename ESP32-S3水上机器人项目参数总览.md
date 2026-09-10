@@ -1,8 +1,8 @@
 # ESP32-S3 水上机器人项目参数总览
 
 > 📌 本文档为唯一项目参数权威来源, 所有代码改动须与本文档一致.
-> 文档版本: **v5.7.7** (远端文档同步 v2.18: m_comp 暂定 1.6 kg, 配重 = **1871.28 g**; v5.7.6: v2.14→v2.17 同步, 机身干质量 1.214→1.2kg, 配重公式 3457.28→3471.28-m_comp g; 水舱数据体系更新 — F浮=50.14N, 水舱 879669.08 mm³ (挡板距前端 80mm), 半水平衡 439.83ml; `tank_volume_l`=0.879669, `neutral_volume_l`=0.43983; 协议无变化, 仅文档同步)
-> 配套远端文档: [`..\ESP32-S3-below\ESP32-S3水下机器人项目参数总览.md`](../ESP32-S3-below/ESP32-S3水下机器人项目参数总览.md) (v2.18)
+> 文档版本: **v5.7.8** (同步远端 v2.19: 控制帧/转发子帧 `frame[6]` 由 `remote_dir` 改为 `bucket_speed` (int8, -100~+100, 0=停), 用于远端 L298N 铲斗电机; v5.7.7: m_comp 暂定 1.6 kg, 配重 = **1871.28 g**; v5.7.6: v2.14→v2.17 同步, 机身干质量 1.214→1.2kg, 配重公式 3457.28→3471.28-m_comp g; 水舱数据体系更新)
+> 配套远端文档: [`..\ESP32-S3-below\ESP32-S3水下机器人项目参数总览.md`](../ESP32-S3-below/ESP32-S3水下机器人项目参数总览.md) (v2.19)
 
 ---
 
@@ -13,7 +13,7 @@
 | 节点 | 角色 | 硬件 | 网络角色 |
 |---|---|---|---|
 | **主控制节点** (本项目) | 核心控制 + 数据处理 + 指令分发 | MPU6050 + 2 ESC + 1 L298N + 2 舵机 | TCP **Server** (双端口) + **UART** (RDK X5) |
-| **远端执行节点** (另一 ESP32-S3, 用户负责) | 远端执行 + 本地传感 + **压载深度控制 (v2.0)** | MPU6050 + 2 ESC + **3× MS5837 + 泵/阀** | TCP **Client** |
+| **远端执行节点** (另一 ESP32-S3, 用户负责) | 远端执行 + 本地传感 + **压载深度控制 (v2.0)** | MPU6050 + 2 ESC + **1 路 L298N 铲斗电机 (v2.19)** + **4× MS5837 + 泵/阀** | TCP **Client** |
 | **RDK X5** (地平线 AI 开发板) | 视觉处理 + AI 识别 (网络摄像头) | 摄像头 + AI 算力 | **UART** (本节点) |
 | **网络摄像头** (局域网) | 视频源 | 摄像头 | IP 视频流 (RTSP/HTTP) |
 | **上位机** (笔记本) | 人工控制 + 姿态解算 + 决策 | 无 (软件) | TCP **Client** + 接收 RDK X5 AI 结果 |
@@ -86,8 +86,8 @@
 | 3 | **speed** | **int8** | **整体推进速度 (-100~+100, 正=前进)** |
 | 4 | **yaw** | **int8** | **偏航/转向 (-100~+100, 正=右转)** |
 | 5 | **remote_light** | **uint8** | **远端灯开关 (0=关, 1=开)** |
-| 6 | **remote_dir** | **uint8** | **远端电机 (0=停, 1=正, 2=反)** |
-| 7 | reserved | uint8 | 保留 (L298N 由 speed 自动计算) |
+| 6 | **bucket_speed** | **int8** | **远端 L298N 铲斗电机速度 (-100~+100, 0=停)** |
+| 7 | reserved | uint8 | 保留 |
 | 8-9 | ~~servo~~ | ~~uint8~~ | **~~已删除~~** (原舵机控制) |
 | 10 | flags | uint8 | bit0: 本地执行 / bit1: 转发远端 |
 | 11-14 | reserved | uint8 | 保留 |
@@ -114,13 +114,13 @@
 | 3 | **speed** | **int8** | **速度** |
 | 4 | **yaw** | **int8** | **偏航** |
 | 5 | **remote_light** | **uint8** | **远端灯开关** |
-| 6 | **remote_dir** | **uint8** | **远端电机方向+停止** |
+| 6 | **bucket_speed** | **int8** | **远端 L298N 铲斗电机速度 (-100~+100, 0=停)** |
 | 7 | CRC8 | uint8 | 前 7 字节异或 |
 
 > **v2.0 深度控制子帧 (cmd=0x11)**: 字节 3-6 语义变为 `target_depth int16 LE (cm)` + `mode` + `保留`,
 > 由 `forward_to_remote()` 在 cmd=0x11 时用 `control_build_depth_fwd_frame()` 构造.
 
-**远端做差速混合** (与主节点本地相同公式) 后驱动 2 电调, 并直接控制灯+电机.
+**远端做差速混合** (与主节点本地相同公式) 后驱动 2 电调, 并按 `bucket_speed` 驱动 L298N 铲斗电机, 同时控制灯.
 
 ### 2.4 MPU 数据帧 (16B) — 双向
 
@@ -196,7 +196,7 @@ dc_dir    = sign(speed)                      →  L298N IN1/IN2
 remote_esc1 = clamp(speed + yaw, -100, +100)
 remote_esc2 = clamp(speed - yaw, -100, +100)
 remote_light = frame[5]  (0=关, 1=开)
-remote_dir   = frame[6]  (0=停, 1=正, 2=反)
+bucket_speed = (int8_t)frame[6]  (-100~+100, 0=停)  → 远端 L298N 铲斗电机
 ```
 
 控制律基于本地 MPU:
@@ -379,7 +379,7 @@ void   control_set_forward_callback(ctrl_forward_cb_t cb);
 /* 帧构造器 (上位机和远端节点开发用) */
 void control_build_ctrl_frame(uint8_t *frame, uint8_t cmd,
     int8_t speed, int8_t yaw,
-    uint8_t remote_light, uint8_t remote_dir, uint8_t flags);
+    uint8_t remote_light, int8_t bucket_speed, uint8_t flags);
 
 void control_build_mpu_frame(uint8_t *frame, uint8_t type,
     int16_t ax, int16_t ay, int16_t az,
@@ -518,9 +518,10 @@ if frame and frame[0] == 0x80:
 
 1. **连接**: 主动 connect 主节点 192.168.29.10:8081
 2. **接收 8B 子帧** (帧头 0xAA 0x55):
-   - 解析 `cmd` + `speed` + `yaw` + `remote_light` + `remote_dir`
+   - 解析 `cmd` + `speed` + `yaw` + `remote_light` + `bucket_speed`
    - 做差速混合 → 控制 2 个电调
-   - 直接控制灯+电机
+   - 按 `bucket_speed` 驱动 L298N 铲斗电机
+   - 直接控制灯
    - **v2.0** `cmd=0x11 DEPTH` → `depth_ctrl_set_target(cm→m)` + 可选强制模式
 3. **接收 16B MPU 帧** (帧头 0xBB 0x66, type=0x01):
    - 主节点发来的本节点 MPU 数据 (备用, 不必处理)
@@ -619,6 +620,7 @@ while (1) {
 | **2026-08** | **v5.6 水上水下联合方案协议** | **control 协议扩展 v2.0: 新增 cmd=0x11 DEPTH (16B 控制帧+8B 子帧, 目标深度 cm+模式) + type=0x03 深度状态帧 (远端→主控→上位机原样转发); main.c `forward_to_remote()` 按 cmd 分支构造深度子帧; 配套远端文档 v2.0** |
 | **2026-08** | **删除 tcp_parser 组件** | **tcp_parser 为 lwip 早期方案遗留 (W5500 TOE 方案下无任何调用), 按文档 §7"遗留, 暂未用"确认无作用后删除组件 + main.c include + REQUIRES** |
 | **2026-08** | **v5.7.7 同步远端 v2.18** | **远端 m_comp 暂定 1.6 kg, 配重 = **1871.28 g**; 协议无变化, 仅文档同步** |
+| **2026-09** | **v5.7.8 同步远端 v2.19 (L298N 铲斗电机)** | **控制帧/转发子帧 `frame[6]` 由 `remote_dir` 改为 `bucket_speed` (int8, -100~+100, 0=停), 用于远端 L298N 铲斗电机; `control.h` 中 `ctrl_command_t.remote_dir` 重命名为 `bucket_speed` (int8), `control_build_ctrl_frame()` 签名同步修改; `control.c` 解析/日志/帧构造更新; `main.c` `forward_to_remote()` 8B 子帧转发 `bucket_speed`; 更新本文档 §1.1/§2.2/§2.3/§2.7/§8.2/§10/版本历史** |
 
 ---
 
@@ -679,4 +681,4 @@ W5500 ready, MAC=... IP=192.168.29.10
 
 > 📝 文档变更需同步更新所有相关代码并测试.
 >
->   最后修改: **v5.7** (协议扩展 v2.0: cmd=0x11 DEPTH + type=0x03 深度状态转发; 删除遗留 tcp_parser 组件)
+>   最后修改: **v5.7.8** (同步远端 v2.19: 控制帧/转发子帧 `frame[6]` 由 `remote_dir` 改为 `bucket_speed`; 删除遗留 tcp_parser 组件为 v5.7 历史记录)

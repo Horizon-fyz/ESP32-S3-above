@@ -8,7 +8,7 @@
  *   │   [3]  speed         int8   整体推进速度 (-100~+100)        │
  *   │   [4]  yaw           int8   偏航/转向 (-100~+100)           │
  *   │   [5]  remote_light  uint8  远端灯开关 (0=关, 1=开)         │
- *   │   [6]  remote_dir    uint8  远端电机 (0=停, 1=正, 2=反)     │
+ *   │   [6]  bucket_speed  int8   L298N 铲斗电机速度 (-100~+100, 0=停) │
  *   │   [7]  reserved      uint8  保留                            │
  *   │   [8-9] reserved     uint8  原舵机, 已删除                   │
  *   │   [10] flags         uint8  bit0=本地执行, bit1=转发远端     │
@@ -19,7 +19,7 @@
  *   │   [3]  speed         int8   速度                            │
  *   │   [4]  yaw           int8   偏航                            │
  *   │   [5]  remote_light  uint8  远端灯开关                      │
- *   │   [6]  remote_dir    uint8  远端电机方向+停止                │
+ *   │   [6]  bucket_speed  int8   远端 L298N 铲斗电机速度 (-100~+100, 0=停) │
  *   │   [7]  CRC8          uint8  前 7 字节异或                   │
  *   ├─────────────────────────────────────────────────────────────┤
  *   │ 帧头 0xBB 0x66: MPU 数据帧 (16 字节) - 双向                 │
@@ -42,8 +42,7 @@
  *   left_esc  = clamp(speed + yaw, -100, +100) → ESC1 (主/远)
  *   right_esc = clamp(speed - yaw, -100, +100) → ESC2 (主/远)
  *   dc_speed  = |speed|                            → L298N PWM
- *   dc_dir    = (speed > 0) ? FORWARD :
- *               (speed < 0) ? REVERSE : STOP       → L298N IN1/IN2
+ *   bucket_speed → 远端 L298N 铲斗电机 (INT8 有符号速度, 0=制动)
  *
  * 主机 (上位机) 控制律基于本地 MPU 数据:
  *   主机接收 MPU 原始数据 → 主机做姿态解算 + 控制律 → 主机发 speed+yaw
@@ -96,7 +95,7 @@ typedef struct {
     int8_t  speed;            /* -100 ~ +100 */
     int8_t  yaw;              /* -100 ~ +100 */
     uint8_t remote_light;     /* 0=关, 1=开 */
-    uint8_t remote_dir;       /* 0=停, 1=正, 2=反 */
+    int8_t  bucket_speed;     /* L298N 铲斗电机速度 -100~+100, 0=停 */
     uint8_t flags;
     /* v2.0 DEPTH 指令 */
     int16_t target_depth_cm;  /* 目标深度 cm */
@@ -122,7 +121,7 @@ void   control_reset(void);
 /* 帧构造器 */
 void control_build_ctrl_frame(uint8_t *frame,
     uint8_t cmd, int8_t speed, int8_t yaw,
-    uint8_t remote_light, uint8_t remote_dir, uint8_t flags);
+    uint8_t remote_light, int8_t bucket_speed, uint8_t flags);
 
 void control_build_mpu_frame(uint8_t *frame,
     uint8_t type,

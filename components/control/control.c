@@ -1,6 +1,6 @@
 /**
  * @file control.c
- * @brief 控制协议 v4.0: 差速驱动 + 远端灯+电机控制
+ * @brief 控制协议 v4.1: 差速驱动 + L298N 铲斗电机 + 远端灯控制
  *
  * 状态机: 字节流扫描, 残帧保留
  *   IDLE → GOT_HEAD0 → LOADING_CTRL (16B) / LOADING_MPU (16B)
@@ -81,7 +81,7 @@ static void handle_ctrl_command(const uint8_t *frame)
         .speed           = (int8_t)frame[3],
         .yaw             = (int8_t)frame[4],
         .remote_light    = frame[5],
-        .remote_dir      = frame[6],
+        .bucket_speed    = (int8_t)frame[6],
         .flags           = frame[10],
         /* v2.0 DEPTH 字段 */
         .target_depth_cm = (int16_t)(frame[3] | (frame[4] << 8)),
@@ -96,8 +96,8 @@ static void handle_ctrl_command(const uint8_t *frame)
         if ((cmd.flags & CTRL_FLAG_FORWARD_REMOTE) && s_forward_cb) {
             s_forward_cb(&cmd);   /* 由 tcp_server 任务发 8B 子帧 */
         }
-        ESP_LOGD(TAG, "CTRL speed=%d yaw=%d light=%d dir=%d flags=0x%02X",
-                 cmd.speed, cmd.yaw, cmd.remote_light, cmd.remote_dir, cmd.flags);
+        ESP_LOGD(TAG, "CTRL speed=%d yaw=%d light=%d bucket=%d flags=0x%02X",
+                 cmd.speed, cmd.yaw, cmd.remote_light, cmd.bucket_speed, cmd.flags);
         break;
 
     case CTRL_CMD_DEPTH:
@@ -264,7 +264,7 @@ uint32_t control_get_frame_count(void)
 
 void control_build_ctrl_frame(uint8_t *frame,
     uint8_t cmd, int8_t speed, int8_t yaw,
-    uint8_t remote_light, uint8_t remote_dir, uint8_t flags)
+    uint8_t remote_light, int8_t bucket_speed, uint8_t flags)
 {
     frame[0]  = CTRL_CTRL_HEAD_0;
     frame[1]  = CTRL_CTRL_HEAD_1;
@@ -272,7 +272,7 @@ void control_build_ctrl_frame(uint8_t *frame,
     frame[3]  = (uint8_t)speed;
     frame[4]  = (uint8_t)yaw;
     frame[5]  = remote_light;
-    frame[6]  = remote_dir;
+    frame[6]  = (uint8_t)bucket_speed;
     frame[7]  = 0;
     frame[8]  = 0;   /* 原 servo 0, 已删除 */
     frame[9]  = 0;   /* 原 servo 1, 已删除 */
