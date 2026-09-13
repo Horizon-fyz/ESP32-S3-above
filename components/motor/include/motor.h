@@ -24,11 +24,11 @@ extern "C" {
  * @brief 电机 ID 枚举
  */
 typedef enum {
-    MOTOR_ESC_1 = 0,    ///< 测试电调 1 (PWM: GPIO1,  ⚠️ 占用 U0TXD, 需 USB-Serial/JTAG 日志)
-    MOTOR_ESC_2,        ///< 测试电调 2 (PWM: GPIO42, MTMS, 可用)
-    MOTOR_MAIN_DC,      ///< 主推进直流电机 (L298N: ENA+IN1+IN2)
-    MOTOR_THRUST_REV_1, ///< 反推电调 1 (PWM: GPIO2)
-    MOTOR_THRUST_REV_2, ///< 反推电调 2 (PWM: GPIO3)
+    MOTOR_ESC_1 = 0,    ///< 推进电调 1 (PWM: GPIO42)
+    MOTOR_ESC_2,        ///< 推进电调 2 (PWM: GPIO41)
+    MOTOR_MAIN_DC,      ///< 主推进直流电机 (L298N: ENA=38 + IN1=48 + IN2=47)
+    MOTOR_THRUST_REV_1, ///< 反推电调 1 (PWM: GPIO40, 与 ESC1/2 同组连续脚)
+    MOTOR_THRUST_REV_2, ///< 反推电调 2 (PWM: GPIO39, 与 ESC1/2 同组连续脚)
     MOTOR_MAX,
 } motor_id_t;
 
@@ -45,19 +45,19 @@ typedef enum {
  * @brief 电机配置
  */
 typedef struct {
-    /* 电调 1 (MOTOR_ESC_1) - 用户指定 GPIO1 */
+    /* 电调 1 (MOTOR_ESC_1) - GPIO42 */
     int      esc1_gpio;         ///< 电调 1 PWM 引脚 (-1=未使用)
     uint32_t esc1_freq_hz;      ///< 电调 1 频率 (典型 50Hz)
     uint8_t  esc1_ledc_timer;
     uint8_t  esc1_ledc_channel;
 
-    /* 电调 2 (MOTOR_ESC_2) - 用户指定 GPIO42 */
+    /* 电调 2 (MOTOR_ESC_2) - GPIO41 */
     int      esc2_gpio;         ///< 电调 2 PWM 引脚 (-1=未使用)
     uint32_t esc2_freq_hz;      ///< 电调 2 频率 (典型 50Hz)
     uint8_t  esc2_ledc_timer;
     uint8_t  esc2_ledc_channel;
 
-    /* L298N 直流电机 (MOTOR_MAIN_DC) - 用户指定 ENA=16, IN1=17, IN2=18 */
+    /* L298N 直流电机 (MOTOR_MAIN_DC) - ENA=38, IN1=48, IN2=47 */
     int      dc_ena_gpio;      ///< ENA 调速 PWM 引脚
     int      dc_in1_gpio;      ///< IN1 方向控制
     int      dc_in2_gpio;      ///< IN2 方向控制
@@ -65,13 +65,13 @@ typedef struct {
     uint8_t  dc_ledc_timer;
     uint8_t  dc_ledc_channel;
 
-    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO2 */
+    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO40 */
     int      rev1_gpio;         ///< 反推电调 1 PWM 引脚 (-1=未使用)
     uint32_t rev1_freq_hz;      ///< 反推电调 1 频率 (典型 50Hz)
     uint8_t  rev1_ledc_timer;
     uint8_t  rev1_ledc_channel;
 
-    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO3 */
+    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO39 */
     int      rev2_gpio;         ///< 反推电调 2 PWM 引脚 (-1=未使用)
     uint32_t rev2_freq_hz;      ///< 反推电调 2 频率 (典型 50Hz)
     uint8_t  rev2_ledc_timer;
@@ -91,7 +91,7 @@ esp_err_t motor_init(const motor_config_t *cfg);
 /**
  * @brief 设置电调油门
  *
- * @param id       电机 ID (目前仅 MOTOR_TEST_ESC)
+ * @param id       电机 ID (MOTOR_ESC_1 / MOTOR_ESC_2 / MOTOR_THRUST_REV_1 / MOTOR_THRUST_REV_2)
  * @param throttle 油门百分比, -100.0 (反向最大) ~ +100.0 (正向最大), 0=停
  */
 esp_err_t motor_set_esc_throttle(motor_id_t id, float throttle);

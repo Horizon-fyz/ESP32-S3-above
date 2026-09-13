@@ -28,12 +28,13 @@ wiznet_manager_config_t wiznet_manager_get_default_config(void)
     wiznet_manager_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    cfg.spi_sck_gpio  = 12;
-    cfg.spi_mosi_gpio = 11;
-    cfg.spi_miso_gpio = 13;
-    cfg.spi_cs_gpio   = 10;
-    cfg.spi_rst_gpio  = -1;
-    cfg.spi_int_gpio  = 9;     /* W5500 INT 接 GPIO9, 中断驱动 */
+    /* 板载 W5500 (v5.10 换板 ESP32-S3-ETH: 引脚由板卡固定, 不再用外置模块) */
+    cfg.spi_sck_gpio  = 13;    /* ETH_CLK  */
+    cfg.spi_mosi_gpio = 11;    /* ETH_MOSI */
+    cfg.spi_miso_gpio = 12;    /* ETH_MISO */
+    cfg.spi_cs_gpio   = 14;    /* ETH_CS   */
+    cfg.spi_rst_gpio  = 9;     /* ETH_RST (独立 GPIO, 可硬复位) */
+    cfg.spi_int_gpio  = 10;    /* ETH_INT, 中断驱动 */
 
     cfg.spi_host     = SPI2_HOST;
     /* W5500 SPI 时钟最高 33.3MHz (datasheet), 但 polling 模式下受 CPU 速率限制.

@@ -3,11 +3,11 @@
  * @brief 电机控制实现 (4 路电调 + 1 路 L298N)
  *
  * LEDC 通道分配 (避免冲突):
- *   ESC1    : Timer0, Channel0  (GPIO1)
- *   ESC2    : Timer0, Channel1  (GPIO42)
- *   REV ESC1: Timer0, Channel2  (GPIO2, 反推)
- *   REV ESC2: Timer0, Channel3  (GPIO3, 反推)
- *   DC      : Timer1, Channel0  (GPIO16)
+ *   ESC1    : Timer0, Channel0  (GPIO42)
+ *   ESC2    : Timer0, Channel1  (GPIO41)
+ *   REV ESC1: Timer0, Channel2  (GPIO40, 反推)
+ *   REV ESC2: Timer0, Channel3  (GPIO39, 反推)
+ *   DC      : Timer1, Channel4  (GPIO38, ENA)
  *
  * 电调 PWM 协议 (50Hz, 20ms 周期, 13 位分辨率):
  *   1.0ms (反向最大) ~ 1.5ms (中位) ~ 2.0ms (正向最大)
@@ -80,39 +80,38 @@ motor_config_t motor_get_default_config(void)
     motor_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
 
-    /* 电调 1 (MOTOR_ESC_1) - 用户指定 GPIO1
-     * ⚠️ GPIO1 = U0TXD, 与日志串口冲突
-     *    启用 USB-Serial/JTAG 日志输出 (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y)
-     *    可释放 GPIO1, 推荐启用 */
-    cfg.esc1_gpio         = 1;
+    /* 推进电调组 (v5.10 换板 ESP32-S3-ETH: 4 路电调排到右排 4 个连续脚 42/41/40/39)
+     * 电调 1 (MOTOR_ESC_1) - GPIO42 */
+    cfg.esc1_gpio         = 42;
     cfg.esc1_freq_hz      = 50;
     cfg.esc1_ledc_timer   = LEDC_TIMER_0;
     cfg.esc1_ledc_channel = LEDC_CHANNEL_0;
 
-    /* 电调 2 (MOTOR_ESC_2) - 用户指定 GPIO42 (MTMS, 可用) */
-    cfg.esc2_gpio         = 42;
+    /* 电调 2 (MOTOR_ESC_2) - GPIO41 */
+    cfg.esc2_gpio         = 41;
     cfg.esc2_freq_hz      = 50;
     cfg.esc2_ledc_timer   = LEDC_TIMER_0;        /* 同 ESC1 共享 Timer0 */
     cfg.esc2_ledc_channel = LEDC_CHANNEL_1;      /* 不同 Channel */
 
-    /* L298N 直流电机 (MOTOR_MAIN_DC) - 用户指定 ENA=16, IN1=17, IN2=18 */
-    cfg.dc_ena_gpio      = 16;
-    cfg.dc_in1_gpio      = 17;
-    cfg.dc_in2_gpio      = 18;
+    /* L298N 直流电机 (MOTOR_MAIN_DC) - ENA=38, IN1=48, IN2=47
+     * 方向两脚 48/47 相邻, ENA 单独放 38 (避开 strapping 脚 46) */
+    cfg.dc_ena_gpio      = 38;
+    cfg.dc_in1_gpio      = 48;
+    cfg.dc_in2_gpio      = 47;
     cfg.dc_pwm_freq_hz   = 5000;  /* 5kHz, 适合直流电机 */
     cfg.dc_ledc_timer    = LEDC_TIMER_1;
-    cfg.dc_ledc_channel  = LEDC_CHANNEL_0;
+    cfg.dc_ledc_channel  = LEDC_CHANNEL_4;  /* Channel0~3 已被 4 路电调占用, DC 必须用其它通道 */
 
-    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO2
+    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO40
      * 与 ESC1/ESC2 共享 Timer0 (50Hz), 使用 Channel2 */
-    cfg.rev1_gpio         = 2;
+    cfg.rev1_gpio         = 40;
     cfg.rev1_freq_hz      = 50;
     cfg.rev1_ledc_timer   = LEDC_TIMER_0;
     cfg.rev1_ledc_channel = LEDC_CHANNEL_2;
 
-    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO3
+    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO39
      * 与 ESC1/ESC2 共享 Timer0 (50Hz), 使用 Channel3 */
-    cfg.rev2_gpio         = 3;
+    cfg.rev2_gpio         = 39;
     cfg.rev2_freq_hz      = 50;
     cfg.rev2_ledc_timer   = LEDC_TIMER_0;
     cfg.rev2_ledc_channel = LEDC_CHANNEL_3;
@@ -127,18 +126,18 @@ esp_err_t motor_init(const motor_config_t *cfg)
     }
     memcpy(&s_cfg, cfg, sizeof(s_cfg));
 
-    /* 电调 1 - GPIO1 */
+    /* 电调 1 - GPIO42 */
     if (cfg->esc1_gpio >= 0) {
         esp_err_t ret = ledc_setup_channel(cfg->esc1_ledc_timer, cfg->esc1_ledc_channel,
                                             cfg->esc1_gpio, cfg->esc1_freq_hz, LEDC_LOW_SPEED_MODE);
         if (ret != ESP_OK) return ret;
         s_channel_configured[MOTOR_ESC_1] = true;
         s_esc_map[MOTOR_ESC_1] = (esc_ledc_map_t){ LEDC_LOW_SPEED_MODE, cfg->esc1_ledc_channel };
-        ESP_LOGW(TAG, "ESC1 enabled on GPIO%d (U0TXD, log via USB-Serial/JTAG required)",
-                 cfg->esc1_gpio);
+        ESP_LOGI(TAG, "ESC1 enabled on GPIO%d (timer=%d, ch=%d)",
+                 cfg->esc1_gpio, cfg->esc1_ledc_timer, cfg->esc1_ledc_channel);
     }
 
-    /* 电调 2 - GPIO42 */
+    /* 电调 2 - GPIO41 */
     if (cfg->esc2_gpio >= 0) {
         /* 检查是否与 ESC1 共享 timer 但频率不同 */
         if (cfg->esc1_gpio >= 0 && cfg->esc1_ledc_timer == cfg->esc2_ledc_timer
@@ -156,7 +155,7 @@ esp_err_t motor_init(const motor_config_t *cfg)
                  cfg->esc2_gpio, cfg->esc2_ledc_timer, cfg->esc2_ledc_channel);
     }
 
-    /* 反推电调 1 - GPIO2 */
+    /* 反推电调 1 - GPIO40 */
     if (cfg->rev1_gpio >= 0) {
         esp_err_t ret = ledc_setup_channel(cfg->rev1_ledc_timer, cfg->rev1_ledc_channel,
                                             cfg->rev1_gpio, cfg->rev1_freq_hz, LEDC_LOW_SPEED_MODE);
@@ -167,7 +166,7 @@ esp_err_t motor_init(const motor_config_t *cfg)
                  cfg->rev1_gpio, cfg->rev1_ledc_timer, cfg->rev1_ledc_channel);
     }
 
-    /* 反推电调 2 - GPIO3 */
+    /* 反推电调 2 - GPIO39 */
     if (cfg->rev2_gpio >= 0) {
         esp_err_t ret = ledc_setup_channel(cfg->rev2_ledc_timer, cfg->rev2_ledc_channel,
                                             cfg->rev2_gpio, cfg->rev2_freq_hz, LEDC_LOW_SPEED_MODE);

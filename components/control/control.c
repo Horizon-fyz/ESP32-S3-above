@@ -1,6 +1,6 @@
 /**
  * @file control.c
- * @brief 控制协议 v4.1: 差速驱动 + L298N 铲斗电机 + 远端灯控制
+ * @brief 控制协议 v5.0 (含 v3.0 沉浮协议): 差速驱动 + L298N 铲斗电机 + 远端灯 + 沉浮转发
  *
  * 状态机: 字节流扫描, 残帧保留
  *   IDLE → GOT_HEAD0 → LOADING_CTRL (16B) / LOADING_MPU (16B)
@@ -83,9 +83,10 @@ static void handle_ctrl_command(const uint8_t *frame)
         .remote_light    = frame[5],
         .bucket_speed    = (int8_t)frame[6],
         .flags           = frame[10],
-        /* v2.0 DEPTH 字段 */
+        /* v3.0 DEPTH 字段 (cmd=0x11) */
         .target_depth_cm = (int16_t)(frame[3] | (frame[4] << 8)),
-        .depth_mode      = frame[5],
+        .target_pitch_deg = (int8_t)frame[5],
+        .target_roll_deg  = (int8_t)frame[6],
     };
 
     switch (cmd.cmd) {
@@ -101,12 +102,12 @@ static void handle_ctrl_command(const uint8_t *frame)
         break;
 
     case CTRL_CMD_DEPTH:
-        /* v2.0 压载深度控制: 目标深度 cm + 模式, 仅转发远端 (主控不下潜) */
+        /* v3.0 沉浮控制: 目标深度 cm + 目标俯仰/横滚°, 仅转发远端 (主控不沉浮) */
         if ((cmd.flags & CTRL_FLAG_FORWARD_REMOTE) && s_forward_cb) {
             s_forward_cb(&cmd);
         }
-        ESP_LOGI(TAG, "CTRL DEPTH target=%dcm mode=%d flags=0x%02X",
-                 cmd.target_depth_cm, cmd.depth_mode, cmd.flags);
+        ESP_LOGI(TAG, "CTRL DEPTH target=%dcm pitch=%ddeg roll=%ddeg flags=0x%02X",
+                 cmd.target_depth_cm, cmd.target_pitch_deg, cmd.target_roll_deg, cmd.flags);
         break;
 
     case CTRL_CMD_STOP:
@@ -307,18 +308,18 @@ void control_build_mpu_frame(uint8_t *frame,
     frame[15] = calc_crc8(frame, 15);
 }
 
-/* v2.0 深度控制帧 (16B, cmd=0x11, 上位机→主控)
- *   [3-4] target_depth int16 LE (cm)  [5] mode (0=自动)  [10] flags */
+/* v3.0 沉浮控制帧 (16B, cmd=0x11, 上位机→主控)
+ *   [3-4] target_depth int16 LE (cm)  [5] target_pitch int8(°)  [6] target_roll int8(°)  [10] flags */
 void control_build_depth_ctrl_frame(uint8_t *frame,
-    int16_t target_depth_cm, uint8_t mode, uint8_t flags)
+    int16_t target_depth_cm, int8_t target_pitch, int8_t target_roll, uint8_t flags)
 {
     frame[0]  = CTRL_CTRL_HEAD_0;
     frame[1]  = CTRL_CTRL_HEAD_1;
     frame[2]  = CTRL_CMD_DEPTH;
     frame[3]  = (uint8_t)(target_depth_cm & 0xFF);
     frame[4]  = (uint8_t)((target_depth_cm >> 8) & 0xFF);
-    frame[5]  = mode;
-    frame[6]  = 0;
+    frame[5]  = (uint8_t)target_pitch;
+    frame[6]  = (uint8_t)target_roll;
     frame[7]  = 0;
     frame[8]  = 0;
     frame[9]  = 0;
@@ -330,17 +331,17 @@ void control_build_depth_ctrl_frame(uint8_t *frame,
     frame[15] = calc_crc8(frame, 15);
 }
 
-/* v2.0 深度控制子帧 (8B, cmd=0x11, 主控→远端)
- *   [3-4] target_depth int16 LE (cm)  [5] mode (0=自动)  [6] 保留 */
+/* v3.0 沉浮控制子帧 (8B, cmd=0x11, 主控→远端)
+ *   [3-4] target_depth int16 LE (cm)  [5] target_pitch int8(°)  [6] target_roll int8(°) */
 void control_build_depth_fwd_frame(uint8_t *frame,
-    int16_t target_depth_cm, uint8_t mode)
+    int16_t target_depth_cm, int8_t target_pitch, int8_t target_roll)
 {
     frame[0] = CTRL_CTRL_HEAD_0;
     frame[1] = CTRL_CTRL_HEAD_1;
     frame[2] = CTRL_CMD_DEPTH;
     frame[3] = (uint8_t)(target_depth_cm & 0xFF);
     frame[4] = (uint8_t)((target_depth_cm >> 8) & 0xFF);
-    frame[5] = mode;
-    frame[6] = 0;
+    frame[5] = (uint8_t)target_pitch;
+    frame[6] = (uint8_t)target_roll;
     frame[7] = calc_crc8(frame, 7);
 }
