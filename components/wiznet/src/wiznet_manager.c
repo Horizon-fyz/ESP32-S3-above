@@ -4,6 +4,12 @@
  */
 
 #include "wiznet_manager.h"
+
+/* ⚠️ FreeRTOS(xtensa 系统头) 必须在 wiznet_conf.h / ioLibrary 之前: 后者会 #undef 掉
+ *    Xtensa 的 `MR`, 好让 w5500.h 的 `MR` 成为首次定义 (见 components/wiznet/include/wiznet_conf.h)。 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "wiznet_spi.h"
 #include "wiznet_socket.h"   /* wiz_close 等命名空间包装 */
 #include "wiznet_conf.h"
@@ -11,8 +17,6 @@
 #include "../Ethernet/socket.h"
 
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -150,7 +154,9 @@ esp_err_t wiznet_manager_init(const wiznet_manager_config_t *cfg)
     /* 5. 配置 PHY: 软件强制 100M FULL
      *
      * 与项目参数文档一致 (PHY 模式 = 100M FULL).
-     * 通过 PHYCR 寄存器直接设置, 无需 MDC/MDIO. */
+     * 访问路径由 `_PHY_IO_MODE_` 决定: 本工程 = **MII 模式**, 即经 MDC/MDIO 软访问
+     * (ioLibrary 的 wizchip_conf.h 原本强制 MII, 现已统一由 wiznet_conf.h 取值;
+     *  直写 PHYCR 寄存器需显式改成 _PHY_IO_MODE_PHYCR_ 并单独验证)。 */
     wiz_PhyConf phyconf = {
         .by     = PHY_CONFBY_SW,
         .mode   = PHY_MODE_MANUAL,

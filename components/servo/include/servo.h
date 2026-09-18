@@ -3,10 +3,10 @@
  * @brief PCA9685 16 路 PWM 舵机驱动 (I2C1)
  *
  * 硬件连接 (v5.10 换板 ESP32-S3-ETH):
- *   SDA = GPIO21
+ *   SDA = GPIO16
  *   SCL = GPIO17
  *   默认地址 0x40 (A0~A5 全部悬空)
- *   ⚠️ 该 I2C1 总线与船体 10 轴 IMU (0x50) 共用, 由本组件负责安装。
+ *   ⚠️ 该 I2C1 总线与云台 MPU6050 (0x68) 共用, 由本组件负责安装。
  *
  * 用途: 控制云台舵机, 通道 0/1 已连接自制云台舵机.
  *
@@ -33,11 +33,22 @@ extern "C" {
  * @brief 舵机配置
  */
 typedef struct {
-    int      sda_gpio;          ///< SDA 引脚, 默认 21 (I2C1, 与船体 10 轴 IMU 共用)
-    int      scl_gpio;          ///< SCL 引脚, 默认 17 (I2C1, 与船体 10 轴 IMU 共用)
+    int      sda_gpio;          ///< SDA 引脚, 默认 16 (I2C1, 与云台 MPU6050 共用; v8.0 起, 原 21)
+    int      scl_gpio;          ///< SCL 引脚, 默认 17 (I2C1, 与云台 MPU6050 共用)
     uint32_t i2c_freq_hz;       ///< I2C 频率, 默认 400kHz
     uint8_t  i2c_addr;          ///< PCA9685 地址, 默认 0x40
     uint16_t pwm_freq_hz;       ///< PWM 输出频率, 舵机一般 50Hz
+
+    /**
+     * @brief **暂时关停 PCA9685** (v5.11.2 新增)
+     *
+     * false = 只把 I2C1 总线装好并保留给**云台 MPU6050**(与 PCA9685 共线的那颗), **不探测、不驱动** PCA9685,
+     *         `servo_init()` 返回 ESP_ERR_NOT_SUPPORTED, `servo_is_ready()` 为 false,
+     *         所有 servo API 返回 ESP_ERR_INVALID_STATE。
+     *         用于"PCA9685 还没接/暂时不用"的阶段, 同时保证同总线的云台 MPU 照常工作。
+     * true  = 正常使用 (默认)。
+     */
+    bool     pca9685_enable;
 } servo_config_t;
 
 /**
@@ -82,7 +93,7 @@ typedef struct {
 } servo_cal_t;
 
 /**
- * 获取默认配置 (I2C1, SDA=4, SCL=5, 400kHz, 50Hz PWM, 地址 0x40)
+ * 获取默认配置 (I2C1, SDA=16, SCL=17, 400kHz, 50Hz PWM, 地址 0x40)
  */
 servo_config_t servo_get_default_config(void);
 

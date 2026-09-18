@@ -2,320 +2,146 @@
  * @file main.c
  * @brief ESP32-S3 W5500 AUV 网络控制器 (主控制节点, TCP Server)
  *
- * [临时测试模式 - 仅保留 PCA9685 + MPU6050, 其他全部注释]
+ * [当前模式 - 启用: W5500 以太网 + **TCP Server 8080 (上位机内网操控)**
+ *   + 水面 4 路电调 (推进 ESC1=IO41 左 / ESC2=IO42 右, 反推 REV1=IO39 左 / REV2=IO40 右;
+ *     ⚠️ 反推**暂时关闭** `REV_ESC_ENABLE=0`: 负油门按停处理, 方向线只保持在正向半区,
+ *     控制台 `l <v>` / `r <v>` / 裸数字) + L298N 滚筒收放电机 (ENA=38 / IN1=48 / IN2=47)
+ *   + 云台舵机 (PCA9685 ch0/ch1): **控制台 `p`/`g`/`n`/`z` 与上位机拖动条 (cmd=0x12) 双路手动**
+ *   + GPS 状态回传 (惯导 GPS → 上位机, type=0x04/0x05, 2Hz, v9.1) + 串口控制台;
+ *  总开关现状: `W5500/MOTOR/NAV/SERVO = 1`, `REV_ESC_ENABLE = 0` (反推暂时关闭),
+ *             `MPU6050_ENABLE = 0` (**云台 MPU 暂时废弃**: 不初始化/不自检, 姿态解算不启动,
+ *             上位机「主控 MPU」回传自动停发); `TEST_MODE = 0` = 云台纯开环 (不自动动作)。
+ *  未启用: 8081 远端转发 (水下节点未就绪)。]
  *
  * 角色: 主控制节点 (核心控制 + 数据处理 + 指令分发)
- * 硬件: MPU6050 + 2 ESC + 1 L298N + 2 Servo + W5500
- * 网络: TCP Server, 双端口
- *   - 8080: 上位机 (笔记本)  - 发送控制指令, 接收 MPU 数据
- *   - 8081: 远端 ESP32-S3 节点 - 接收转发控制 + 双向 MPU 推送
+ * 硬件: W5500 + 4 ESC (2 推进 + 2 反推) + 1 L298N (滚筒收放) + 惯导模块 (GPS+10 轴 IMU)
+ *       (未接: MPU6050 / PCA9685)
+ * 网络: TCP Server, **仅 8080 (上位机)**; 8081 (远端) 暂未启用
+ *   - 8080: 上位机 (笔记本) - 下发 16B 控制帧, 收 16B 状态帧
+ *   - 8081: 远端 ESP32-S3 节点 - 转发控制 + 双向 MPU 推送 (暂未启用, 设计见参数总览 §2)
  *
  * 集成组件:
  *   - wiznet    : 板载 W5500 以太网 (ioLibrary, 20MHz SPI polling, 100M FULL)
- *   - imu       : MPU6050 (I2C0: SDA=16, SCL=18) + 亚博 10轴IMU (I2C1: SDA=21, SCL=17, 0x50)
- *   - servo     : PCA9685 (I2C1: SDA=21, SCL=17)
- *   - gps       : NMEA0183 (UART1: TX=2, RX=1, PPS=3)
+ *   - nav       : **惯导模块** (亚博 GPS+10 轴 IMU 一体, WIT 0x55 协议主动上报,
+ *                 UART2: ESP32 RX=16 <- 模块 TX, ESP32 TX=18 -> 模块 RX)
+ *                 —— 取代了旧的"亚博 10 轴 IMU (7E 23 请求式)"与"旧 GPS (NMEA/UART1 2/1/3)"
+ *   - imu       : MPU6050 (I2C1 共用总线 16/17, 0x68) —— 只剩云台这一颗
+ *   - servo     : PCA9685 (I2C1: SDA=16, SCL=17)
  *   - motor     : 4 ESC (LEDC, 42/41/40/39) + L298N (ENA=38, IN1=48, IN2=47)
- *   - control   : 16B 控制帧 + 16B 状态帧协议 (v3.0 沉浮: cmd=0x11 + type=0x03)
+ *   - control   : 16B 控制帧 + 16B 状态帧**协议解析**; 差速混合与电机驱动在本文件
+ *                 (control 只解析, 通过 control_set_local_callback 回调上来, 见 §2)
  *
- * 任务清单:
- *   - tcp_server_task    优先级 5, 栈 8192, 双 socket 状态机
- *   - mpu_push_task      优先级 4, 栈 2048, 周期 50ms (20Hz)
- *   - status_report_task 优先级 4, 栈 2048, 周期 500ms (保留, 可选)
+ * ⚠️ 16/18 的用途: v5.11.2 起云台 MPU6050 改与 PCA9685 共用 I2C1 (**v8.0 起 SDA=16/SCL=17**), 曾腾出的 16/18
+ *    现给**惯导模块的 UART2**。因此 imu 初始化必须在 servo_init() 之后 (见 4c)。
+ *
+ * 🆕 v5.12 网络联调: 恢复 W5500 + TCP Server (8080) 接收上位机控制帧驱动电调/滚筒;
+ *    差速混合 left=clamp(speed+yaw) / right=clamp(speed-yaw), 正=推进·负=反推 (复用 esc_apply_side);
+ *    bucket_speed 驱动 L298N 滚筒收放; **500ms 收不到控制帧自动全部停机** (失联保护)。
+ *
+ * 🆕 v6.0 惯导替换: 旧 GPS (NMEA/UART1) 与旧"亚博 10 轴 IMU"(`7E 23` 请求式/UART2)
+ *    在本工程里**全部删除**, 换成一块"亚博 GPS+10 轴 IMU 一体惯导模块":
+ *    单条 UART2 + 维特(WIT) 0x55 协议**主动上报** (帧 0x50~0x5A), 由 components/nav
+ *    统一解析出姿态与 GPS 两套快照。控制台 `gps` / `hull` 的数据源都改成了它,
+ *    另加 `nav` 看模块状态 (在线/配置/波特率/帧计数)。详见参数总览 §7.10 与 nav.h。
+ *
+ * 任务清单 (当前实际创建):
+ *   - tcp_server         优先级 5, 栈 8192, W5500 socket 0 (8080) 收发 + 失联保护 (W5500_ENABLE=1 时)
+ *   - nav_task           优先级 4, 栈 3072, 惯导模块 UART 接收/解析 (nav 组件内部创建)
+ *   - nav_gps_log        优先级 4, 栈 4096, 1Hz 惯导 GPS 日志 (NAV_ENABLE=1 时创建, 默认静默)
+ *   - nav_att_log        优先级 4, 栈 4096, 10Hz 惯导姿态日志 (NAV_ENABLE=1 时创建, 默认静默)
+ *   - attitude           优先级 5, 栈 4096, 100Hz Madgwick 姿态解算 (MPU6050_ENABLE=1 时才启动)
+ *   - ch0_test/ch1_test  优先级 4, 栈 3072, 舵机扫描测试 (SERVO_ENABLE=0 时启动即自退出)
+ *   - stab_test          优先级 4, 栈 4096, 云台闭环自稳 (TEST_MODE==4; SERVO_ENABLE=0 时启动即自退出)
+ *   - console_repl       优先级 5, 栈 4096, 串口标定控制台
+ * 未创建 (设计保留在参数总览 §2, 代码待恢复): mpu_push_task / status_report_task / 8081 转发子帧
  */
-
-//#include "wiznet_conf.h"
-//#include "wizchip_conf.h"
-//#include "wiznet_socket.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-//#include <inttypes.h>
-//#include <stdatomic.h>
+
+/* ⚠️ include 顺序要求: **FreeRTOS(xtensa 系统头) 必须在 ioLibrary 之前**。
+ *    原因见 components/wiznet/include/wiznet_conf.h —— 那里会 #undef 掉 Xtensa 的 `MR`,
+ *    好让 w5500.h 的 `MR` 成为首次定义 (否则 "MR redefined" 警告必出且无法用开关关闭)。 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "wiznet_conf.h"
+#include "wizchip_conf.h"
+#include "wiznet_socket.h"
+
 #include "esp_log.h"
 #include "esp_console.h"
 #include "linenoise/linenoise.h"
 #include "esp_timer.h"
-//#include "esp_heap_caps.h"
-//#include "esp_task_wdt.h"
 #include "nvs_flash.h"
-//#include "wiznet_manager.h"
-//#include "wiznet_spi.h"
-//#include "motor.h"
+#include "driver/gpio.h"          /* gpio_config: 板载 WS2812 数据脚 (GPIO21) 钉低
+                                   * (wiznet_spi.h 也会带进来, 这里显式包含) */
+#include "wiznet_manager.h"
+#include "wiznet_spi.h"
+#include "motor.h"
 #include "imu.h"
 #include "servo.h"
 #include "gimbal.h"
-#include "gps.h"
-//#include "control.h"
+#include "nav.h"
+#include "control.h"
 
-/* ========== TCP 服务器配置 ========== */
-//#define TCP_HOST_PORT     8080    /* 上位机 (笔记本) */
-//#define TCP_REMOTE_PORT   8081    /* 远端 ESP32-S3 节点 */
-//#define HOST_SOCK         0
-//#define REMOTE_SOCK       1
-//#define RX_BUFFER_SIZE    1024
-//#define TX_BUFFER_SIZE    512
-//#define MPU_FRAME_SIZE    16
+/* ========== TCP 服务器配置 ==========
+ * 只启用 socket 0 = 8080 (上位机)。8081 (远端 ESP32-S3 水下节点) 暂未启用:
+ * 水下节点未就绪, 转发子帧/MPU 推送的设计保留在参数总览 §2, 需要时再加 socket 1。 */
+#define TCP_HOST_PORT     8080    /* 上位机 (笔记本) */
+#define HOST_SOCK         0
+#define RX_BUFFER_SIZE    1024
+
+/* 失联保护: 已连接且收到过控制帧, 但超过这么久没有新帧 ⇒ 全部电机归零。
+ * 上位机正常按 20Hz 下发, 500ms = 连续丢 10 帧, 足以区分"网络抖动"与"真失联"。 */
+#define TCP_LINK_TIMEOUT_MS  500
 
 /* 硬件引脚定义 */
 
-/* GPS 引脚 (UART1) —— v5.10 换板后取左排 2/1/3 三个相邻脚 */
-#define GPS_TX_GPIO       2       /* ESP32 TX -> GPS RX */
-#define GPS_RX_GPIO       1       /* ESP32 RX <- GPS TX */
-#define GPS_PPS_GPIO      3       /* PPS 秒脉冲输入 (strapping 脚, 仅输入), -1 = 不用 */
+/* (v6.0 删除) 旧 GPS 的 UART1 引脚 TX=GPIO2 / RX=GPIO1 / PPS=GPIO3 —— 硬件与驱动都已移除,
+ *   2/1/3 三个脚现已空闲; 惯导模块的引脚在 components/nav 里 (UART2: RX=16 / TX=18)。 */
 
-//static uint8_t s_rx_buffer[RX_BUFFER_SIZE];
-//static uint8_t s_tx_buffer[TX_BUFFER_SIZE];
-//static uint8_t s_mpu_frame[MPU_FRAME_SIZE];
+static uint8_t s_rx_buffer[RX_BUFFER_SIZE];
 
 static const char *TAG = "APP";
 
-/* ========== 连接状态 ========== */
-//static atomic_bool s_host_connected   = ATOMIC_VAR_INIT(false);
-//static atomic_bool s_remote_connected = ATOMIC_VAR_INIT(false);
+/* ========== 网络连接状态 (TCP 任务读写; 控制台 `net` 只读) ========== */
+static volatile bool     s_host_connected = false;  /* socket 0 (8080) 是否已建立 */
+static volatile int64_t  s_last_ctrl_us   = 0;      /* 最近一次有效控制帧的时刻 (0=尚未收到) */
+static volatile uint32_t s_ctrl_frames    = 0;
 
-/* ========== 任务句柄 ========== */
-//static TaskHandle_t s_mpu_push_task_handle = NULL;
-//static TaskHandle_t s_status_report_task_handle = NULL;
+/* ========== 主控 MPU 状态回传 (v8.1) ==========
+ * 上位机 `tools/tcp_console.py` 的「主控 MPU」面板收 **type=0x01** 的 16B 状态帧
+ * (0xBB 0x66 + 6×int16 LE 原始 6 轴), 按 20Hz 刷新。
+ * ⚠️ **不在 TCP 任务里读 I2C** —— 会与 100Hz 的 `attitude_task` 抢同一条 I2C1:
+ *    由 `attitude_task` 顺手把换算好的 int16 塞进 `s_mpu_raw[]`, TCP 任务只取快照发送。
+ * 换算 (参数总览 §7.5.5): 加速度 ±2g → ×16384 LSB/g; 陀螺仪 ±250°/s → ×131 LSB/(°/s)。 */
+#define MPU_PUSH_PERIOD_US    50000     /* 20Hz */
+static volatile int16_t s_mpu_raw[6]    = {0};     /* ax ay az gx gy gz (LSB) */
+static volatile bool    s_mpu_raw_valid = false;   /* attitude_task 至少填过一次 */
+static int64_t          s_mpu_next_us   = 0;       /* 下次发送时刻 (0 = 重连后立刻发) */      /* 累计收到的控制帧数 */
 
-/* ========== 协议实现 ========== */
-
-///* 主 → 远端 转发 (由 control 模块通过回调调用)
-// *
-// * 收到上位机 16B 控制帧后, 若 flags bit1 置位, 主节点构造 8B 子帧
-// * 通过 socket 1 发给远端. 8B 子帧携带 speed+yaw+light+bucket_speed, 远端
-// * 自行做差速混合并驱动 L298N 铲斗电机. v3.0: cmd=0x11 DEPTH 时构造沉浮子帧
-// * (目标深度 cm + 目标俯仰° + 目标横滚°). */
-//static void forward_to_remote(const ctrl_command_t *cmd)
-//{
-//    if (!atomic_load(&s_remote_connected)) {
-//        ESP_LOGW("control", "远程未连接, 转发丢弃");
-//        return;
-//    }
-//
-//    if (cmd->cmd == CTRL_CMD_DEPTH) {
-//        /* v3.0 沉浮控制子帧: AA 55 0x11 depth_cm(LE) pitch(°) roll(°) CRC */
-//        uint8_t fwd[CTRL_FWD_FRAME_SIZE];
-//        control_build_depth_fwd_frame(fwd, cmd->target_depth_cm,
-//                                      cmd->target_pitch_deg, cmd->target_roll_deg);
-//        int32_t sent = wiz_send(REMOTE_SOCK, fwd, CTRL_FWD_FRAME_SIZE);
-//        if (sent != CTRL_FWD_FRAME_SIZE) {
-//            ESP_LOGW("control", "转发沉浮到远端失败: %d", (int)sent);
-//        }
-//        return;
-//    }
-//
-//    /* 构造 8B 子帧: AA 55 cmd speed yaw remote_light bucket_speed CRC */
-//    uint8_t fwd[CTRL_FWD_FRAME_SIZE];
-//    fwd[0] = CTRL_CTRL_HEAD_0;
-//    fwd[1] = CTRL_CTRL_HEAD_1;
-//    fwd[2] = cmd->cmd;
-//    fwd[3] = (uint8_t)cmd->speed;
-//    fwd[4] = (uint8_t)cmd->yaw;
-//    fwd[5] = cmd->remote_light;
-//    fwd[6] = (uint8_t)cmd->bucket_speed;
-//    uint8_t crc = 0;
-//    for (int i = 0; i < 7; i++) crc ^= fwd[i];
-//    fwd[7] = crc;
-//
-//    int32_t sent = wiz_send(REMOTE_SOCK, fwd, CTRL_FWD_FRAME_SIZE);
-//    if (sent != CTRL_FWD_FRAME_SIZE) {
-//        ESP_LOGW("control", "转发到远端失败: %d", (int)sent);
-//    }
-//}
-
-///* MPU 数据推送到上位机 (由 control 模块通过 handle_mpu_frame 调用) */
-//void tcp_server_forward_mpu_to_host(const ctrl_mpu_data_t *m)
-//{
-//    if (!atomic_load(&s_host_connected)) return;
-//    control_build_mpu_frame(s_mpu_frame, m->type,
-//                            m->ax, m->ay, m->az, m->gx, m->gy, m->gz);
-//    int32_t sent = wiz_send(HOST_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
-//    if (sent != MPU_FRAME_SIZE) {
-//        ESP_LOGW("control", "MPU 推上位机失败: %d", (int)sent);
-//    }
-//}
-
-///* MPU 数据推送到远端 (主节点 MPU 自身) */
-//static void push_mpu_to_remote(uint8_t type, int16_t ax, int16_t ay, int16_t az,
-//                                int16_t gx, int16_t gy, int16_t gz)
-//{
-//    if (!atomic_load(&s_remote_connected)) return;
-//    control_build_mpu_frame(s_mpu_frame, type, ax, ay, az, gx, gy, gz);
-//    wiz_send(REMOTE_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
-//}
+/* ========== 协议实现 (v5.12) ==========
+ *
+ * 分工: `control` 组件只做**协议解析** (帧同步 / CRC / 字段解码), 解析出的
+ * ctrl_command_t 通过 control_set_local_callback() 回调到本文件的
+ * tcp_apply_local_command(), 由本文件按当前硬件执行差速混合与电机驱动。
+ * 原因: 原先 control.c 内部写死了旧硬件 (2 路电调 + L298N 由 |speed| 驱动),
+ *       把负油门发给单向电调会被 motor_set_esc_throttle() 钳成 0, 反推两路永不动。
+ *
+ * 三个实现函数在文件后面 (它们要用 esc_apply_side / motor_apply_speed, 定义在控制台命令区之后):
+ *   tcp_apply_local_command()        — 差速混合 + 4 路电调 + L298N 滚筒 (静默, 20Hz 不打印)
+ *   tcp_server_task()                — TCP Server 8080 主循环 + 500ms 失联保护
+ *   tcp_server_forward_mpu_to_host() — 状态回传占位 (当前无 MPU 数据源, 见文件头 v5.12 说明)
+ *
+ * 🗑️ v5.12 删除: 原 forward_to_remote / handle_socket / tcp_server_task / mpu_push_task /
+ *    status_report_task 那一大段**注释代码**。它们按旧硬件写死 (2 路电调 / 8081 转发 /
+ *    L298N 由 |speed| 驱动), 与现状不符, 留着只会误导。8081 转发与 MPU 推送的**设计**
+ *    保留在参数总览 §2, 将来要用时照那章重新实现即可。 */
 
 /* ========== 任务实现 ========== */
-
-///* 通用 socket 处理: listen -> 接收 -> 解析 -> 关闭重建 */
-//static void handle_socket(uint8_t sock, const char *name,
-//                          atomic_bool *connected_flag, void (*on_connect)(void))
-//{
-//    uint8_t sr = getSn_SR(sock);
-//    int32_t n;
-//
-//    switch (sr) {
-//    case SOCK_ESTABLISHED:
-//        if (!(*connected_flag)) {
-//            *connected_flag = true;
-//            ESP_LOGI("TCP", "[%s] 已连接", name);
-//            control_reset();   /* 切换连接时清空残帧 */
-//            if (on_connect) on_connect();
-//        }
-//        n = wiz_recv(sock, s_rx_buffer, sizeof(s_rx_buffer));
-//        if (n > 0) {
-//            /* 用独立的解析器, 因为两条链路可能并发 */
-//            control_process(s_rx_buffer, (size_t)n);
-//        } else if (n == SOCK_BUSY) {
-//            vTaskDelay(pdMS_TO_TICKS(2));
-//        } else {
-//            /* 对端关闭或错误 */
-//            wiz_close(sock);
-//            *connected_flag = false;
-//            ESP_LOGI("TCP", "[%s] 已断开 (n=%d)", name, (int)n);
-//            if (wiz_socket(sock, Sn_MR_TCP, (sock == HOST_SOCK) ? TCP_HOST_PORT : TCP_REMOTE_PORT,
-//                           SF_TCP_NODELAY) == (int8_t)sock) {
-//                wiz_listen(sock);
-//            }
-//        }
-//        break;
-//
-//    case SOCK_CLOSE_WAIT:
-//        *connected_flag = false;
-//        wiz_close(sock);
-//        if (wiz_socket(sock, Sn_MR_TCP, (sock == HOST_SOCK) ? TCP_HOST_PORT : TCP_REMOTE_PORT,
-//                       SF_TCP_NODELAY) == (int8_t)sock) {
-//            wiz_listen(sock);
-//        }
-//        break;
-//
-//    case SOCK_CLOSED:
-//        *connected_flag = false;
-//        if (wiz_socket(sock, Sn_MR_TCP, (sock == HOST_SOCK) ? TCP_HOST_PORT : TCP_REMOTE_PORT,
-//                       SF_TCP_NODELAY) == (int8_t)sock) {
-//            wiz_listen(sock);
-//        } else {
-//            vTaskDelay(pdMS_TO_TICKS(100));
-//        }
-//        break;
-//
-//    default:
-//        vTaskDelay(pdMS_TO_TICKS(10));
-//        break;
-//    }
-//}
-
-///**
-// * @brief TCP 服务器任务 (双 socket)
-// *
-// * Socket 0 = 8080 (上位机)
-// * Socket 1 = 8081 (远端)
-// *
-// * 注意: 本任务做阻塞式 SPI 通讯, 不订阅 Task WDT.
-// */
-//static void tcp_server_task(void *pvParameters)
-//{
-//    esp_task_wdt_delete(NULL);
-//
-//    /* 注册主→远端 转发回调 */
-//    control_set_forward_callback(forward_to_remote);
-//
-//    /* 启动 socket 0 (8080 上位机) */
-//    if (wiz_socket(HOST_SOCK, Sn_MR_TCP, TCP_HOST_PORT, SF_TCP_NODELAY) != HOST_SOCK) {
-//        ESP_LOGE("TCP", "socket 0 (HOST) failed");
-//    } else if (wiz_listen(HOST_SOCK) != SOCK_OK) {
-//        ESP_LOGE("TCP", "listen 8080 failed");
-//        wiz_close(HOST_SOCK);
-//    }
-//
-//    /* 启动 socket 1 (8081 远端) */
-//    if (wiz_socket(REMOTE_SOCK, Sn_MR_TCP, TCP_REMOTE_PORT, SF_TCP_NODELAY) != REMOTE_SOCK) {
-//        ESP_LOGE("TCP", "socket 1 (REMOTE) failed");
-//    } else if (wiz_listen(REMOTE_SOCK) != SOCK_OK) {
-//        ESP_LOGE("TCP", "listen 8081 failed");
-//        wiz_close(REMOTE_SOCK);
-//    }
-//
-//    ESP_LOGI("TCP", "=== TCP 服务器已启动: 8080(HOST) + 8081(REMOTE) ===");
-//
-//    while (1) {
-//        esp_task_wdt_reset();
-//
-//        /* INT 唤醒 (如果有) */
-//        wiznet_spi_check_int();
-//
-//        /* 交替处理两个 socket */
-//        handle_socket(HOST_SOCK,   "HOST",   &s_host_connected,   NULL);
-//        handle_socket(REMOTE_SOCK, "REMOTE", &s_remote_connected, NULL);
-//    }
-//}
-
-///* MPU 推送任务: 20Hz 读取本地 MPU, 推送到上位机 + 远端 */
-//static void mpu_push_task(void *pvParameters)
-//{
-//    esp_task_wdt_delete(NULL);
-//    TickType_t last_wake = xTaskGetTickCount();
-//    const TickType_t period = pdMS_TO_TICKS(50);  /* 20Hz */
-//
-//    imu_data_t m = {0};
-//
-//    while (1) {
-//        esp_task_wdt_reset();
-//        vTaskDelayUntil(&last_wake, period);
-//
-//        /* 读取本地云台 MPU (静默失败时不上报) */
-//        if (imu_read_role(IMU_ROLE_GIMBAL, &m) == ESP_OK) {
-//            int16_t ax = (int16_t)(m.ax * 16384.0f);
-//            int16_t ay = (int16_t)(m.ay * 16384.0f);
-//            int16_t az = (int16_t)(m.az * 16384.0f);
-//            int16_t gx = (int16_t)(m.gx * 131.0f);
-//            int16_t gy = (int16_t)(m.gy * 131.0f);
-//            int16_t gz = (int16_t)(m.gz * 131.0f);
-//
-//            /* 推上位机 (type=LOCAL) */
-//            if (atomic_load(&s_host_connected)) {
-//                control_build_mpu_frame(s_mpu_frame, CTRL_MPU_TYPE_LOCAL,
-//                                        ax, ay, az, gx, gy, gz);
-//                int32_t sent = wiz_send(HOST_SOCK, s_mpu_frame, MPU_FRAME_SIZE);
-//                if (sent != MPU_FRAME_SIZE) {
-//                    ESP_LOGW("TCP", "MPU 推上位机失败: %d", (int)sent);
-//                }
-//            }
-//            /* 推远端 (type=LOCAL, 远端知道是主节点发的) */
-//            push_mpu_to_remote(CTRL_MPU_TYPE_LOCAL, ax, ay, az, gx, gy, gz);
-//        }
-//    }
-//}
-
-///* 状态上报任务: 500ms 周期 JSON, 保留备用 (可选启动) */
-//static void status_report_task(void *pvParameters)
-//{
-//    esp_task_wdt_delete(NULL);
-//    TickType_t last_wake = xTaskGetTickCount();
-//    const TickType_t period = pdMS_TO_TICKS(500);
-//
-//    while (1) {
-//        esp_task_wdt_reset();
-//        vTaskDelayUntil(&last_wake, period);
-//
-//        if (!atomic_load(&s_host_connected)) continue;
-//
-//        /* 简化的状态: 实际可由 cJSON 构造, 此处先输出最少信息 */
-//        int n = snprintf((char *)s_tx_buffer, sizeof(s_tx_buffer),
-//                         "{\"uptime_ms\":%lld,\"link\":true,\"host\":%d,\"remote\":%d,\"frames\":%lu}\n",
-//                         (long long)(esp_timer_get_time() / 1000),
-//                         atomic_load(&s_host_connected) ? 1 : 0,
-//                         atomic_load(&s_remote_connected) ? 1 : 0,
-//                         (unsigned long)control_get_frame_count());
-//        if (n > 0) {
-//            wiz_send(HOST_SOCK, s_tx_buffer, (uint16_t)n);
-//        }
-//    }
-//}
 
 /* ========== [临时测试] PCA9685 + MPU6050 俯仰角控制任务 (Madgwick AHRS) ========== */
 
@@ -438,11 +264,11 @@ static void quaternion_to_ypr(const float *q, float *ypr)
 /* 姿态日志开关 (默认关; C1-MPU 关系测定任务已自带倾角输出, 需要融合结果再输 att 1) */
 static volatile bool s_att_log_enabled = false;
 
-/* GPS 1Hz 日志开关 (默认关, 用 gps 1 开启) */
+/* 惯导 GPS 1Hz 日志开关 (默认关, 用 gps 1 开启) */
 static volatile bool s_gps_log_enabled = false;
 
-/* 船体(亚博) 10 轴 IMU 日志开关 (默认开, 10Hz 输出; 用 hull 0 关闭) */
-static volatile bool s_hull_log_enabled = true;
+/* 惯导姿态 10Hz 日志开关 (默认关, 用 hull 1 开启; 不带参数读一帧) */
+static volatile bool s_hull_log_enabled = false;
 
 /* 姿态任务输出的最新欧拉角 (°)
  * 供其它任务读取, 这样它们不必自己再读 I2C —— imu 组件没有互斥保护,
@@ -537,15 +363,100 @@ static volatile bool s_ch1_test_enabled = false;
 #define CH1_SCAN_STEP_US    20      /* 每档步进 (µs) */
 #define CH1_SCAN_DWELL_MS   1000    /* 每档停留时间 (ms) */
 
+/* 板载 WS2812 RGB LED 的数据脚 = **GPIO26** (用户按原理图/实测确认; **不在 40Pin 排针上**,
+ * 属板内网络。Waveshare 官方 wiki 的 `RGB_LED` 示例写 GPIO21 —— 那与本板实况不符, 忽略)。
+ *   ⚠️ 为什么它会常亮刺眼的白光: WS2812 把数据脚上的**任意边沿**当颜色数据采样 —— 只要该脚
+ *      被当 I2C SDA / SPI / 普通翻转用, 锁存值就是随机的; 白色 = 三通道全开最亮, 所以最显眼。
+ *      而且它会**一直保持最后锁存的值** (不掉电不清除) ⇒ 必须 ① 不再给它任何边沿, ② **断电重上一次**。
+ *   ⚠️ 以后要拿它当状态灯, 必须用 **RMT** 精确时序驱动 (位宽容差 ±150ns, 普通 GPIO 打拍不达标)。*/
+#define BOARD_RGB_LED_GPIO  26
+
 /* ========== 测试任务选择 ==========
  * 同一时刻只能有一个"驱动舵机"的测试任务在跑, 否则两条指令流会互相打架.
- *   0 = 无测试任务 (两舵机保持开机回中的中位, 不动作)
+ *   0 = 无测试任务 (两舵机保持开机回中的中位, 不动作) —— **当前**
  *   1 = 云台运动规划测试 (速度/加速度受限, 用于抑制大惯量载荷的冲击与过冲)
  *   2 = ch1 舵机 <-> MPU 关系测定 (俯仰轴, 用重力矢量夹角)
  *   3 = ch0 舵机 <-> MPU 关系测定 (平面旋转轴, 用融合后的偏航角)
  *   4 = 云台闭环自稳测试 (ch1 俯仰闭环, 开机自动开启并打印误差)
+ *
+ * ⚠️ 当前取 0 的原因: **云台暂时不接 MPU 反馈** —— MPU6050 的用途还没定,
+ *    云台先做"纯开环"测试 (位置/标定/行程), 不跑任何"每周期抢写舵机"的任务:
+ *      · 没有 2/3/4 ⇒ 不会开机自动动作、不会把手动指令 (`p`/`n`/`z`/`ck`) 抢回去;
+ *      · `t0 1` / `t1 1` 两个扫描任务仍可用 (它们不依赖 MPU, 且默认关闭);
+ *      · 闭环命令 `ge`/`gt`/`gp` 仍注册着, 但**没人自动开**, 要手动 `ge 1 1` 才会用 MPU 反馈
+ *        —— 真要用闭环时, 请同时确认 MPU6050_ENABLE=1 且云台 MPU 已接好。
  */
-#define TEST_MODE           4
+#define TEST_MODE           0
+
+/* [总开关] PCA9685 舵机 (云台) —— 当前启用
+ *   0 = 关停: 不探测/不驱动 PCA9685, 云台运动规划与闭环自稳测试都不启用。
+ *             ⚠️ 是否仍调 servo_init() 只看"还有没有别的 I2C1 使用者":
+ *                云台 MPU6050 与 PCA9685 共线, 且只是**借用**总线 ⇒ MPU6050_ENABLE=1 时仍需它装;
+ *                (v6.0 起船体姿态改由 components/nav 走 UART2, 不再占用 I2C1)
+ *                两者都为 0 时跳过 servo_init(), 连总线都不装。
+ *   1 = 启用 (当前): 恢复正常 (舵机/闭环/TEST_MODE 全生效)。
+ */
+#define SERVO_ENABLE        1
+
+/* [总开关] 云台 MPU6050 + 姿态解算 (attitude_task) —— **当前暂时关停**
+ *   ⚠️ MPU6050 与 PCA9685 **共用 I2C1** (**v8.0 起 SDA=16 / SCL=17**), 不再是 I2C0 (原 16/18);
+ *      所以它的初始化在 servo_init() 之后 (见 start_components 的 4c)。
+ *   0 = 关停 (当前): **不初始化、不做地址自检、也不读有效性** —— 不会出现"引脚自检/0x68 无应答/
+ *       未找到 MPU6050"这类 ERROR; `attitude_task`(100Hz 姿态解算) 不创建, 因此
+ *       ① 上位机「主控 MPU」面板恒为 `--` (回传自动停发, 无数据源);
+ *       ② 云台闭环 (`ge`/`gt`/`gp`) 失去反馈源, 只能当空操作 (要闭环请先把本开关置 1)。
+ *       惯导模块 (nav, UART2) 完全不受影响。
+ *   1 = 启用: 恢复云台姿态/闭环反馈 (原行为)。
+ *   📌 当前云台的定位是"**上位机/控制台手动摆位**"(见 cmd=0x12 与 §7.9), 不依赖 MPU。
+ */
+#define MPU6050_ENABLE      0
+
+/* [总开关] 惯导模块 (亚博 GPS + 10 轴 IMU 惯导组合, WIT 0x55 协议) —— 当前启用
+ *   说明: 硬件其实是**两块板** (GPS 板 + 10 轴 IMU 板), 官方"融合"后由**一条 UART** 输出,
+ *         上位机侧当作**一个**模块用 —— 同一帧流里既有姿态也有 GPS。
+ *   接口: UART2, ESP32 RX=IO1 <- 模块 TX / ESP32 TX=IO2 -> 模块 RX, 9600 8N1
+ *         (波特率初始化时自扫描 9600~230400, 见 nav.h)
+ *   0 = 关停: 不装 UART2、不初始化、不创建日志任务; 控制台 `gps` / `hull` / `nav`
+ *             只提示模块未就绪。**components/nav 组件与接口代码原样保留**, 置 1 即恢复。
+ *   1 = 启用 (当前): nav_init() 装 UART + 按需配置模块输出 (RSW=0x058F, RRATE=5Hz) + 收数据。
+ *   注: 该模块**取代**了旧的"亚博 10 轴 IMU"(`7E 23` 请求式)与旧 GPS (NMEA/UART1),
+ *       那两套代码在本工程里已删除。
+ */
+#define NAV_ENABLE          1
+
+/* [总开关] 电机 —— 水上 4 路电调 (2 推进 + 2 反推) + L298N 滚筒收放
+ *   1 = 初始化全部 5 个通道:
+ *         推进 ESC1/ESC2 -> IO41(左) / IO42(右)   帧率 50Hz, 单向 SkyWalker V2
+ *         反推 REV1/REV2 -> IO39(左) / IO40(右)   同上
+ *         L298N          -> ENA=IO38 (5kHz PWM 调速) / IN1=IO48 / IN2=IO47 (方向)
+ *   0 = 完全不初始化电机 —— ⚠️ 注意: 这会让 GPIO38/47/48 变回输入(悬空),
+ *       拔掉 ENA 跳线帽时 L298N 的输入悬空可能误动作, 所以**保持 1 更安全**
+ *       (引脚被主动驱动为 ENA=0 / IN1=IN2=0 = 停机)。
+ * 控制入口: 控制台 `l/r <-100~100>` (电调)、`m <-100~100>` (L298N 滚筒);
+ *           TCP 联调时由上位机帧驱动 —— speed/yaw 差速混合给 4 路电调,
+ *           bucket_speed 给 L298N 滚筒, 见 tcp_apply_local_command()。
+ * 反推另行开关: 见下面 REV_ESC_ENABLE。
+ */
+#define MOTOR_ENABLE        1
+
+/* [总开关] 反推 (电调"反推刹车"的方向线: REV1=IO39 左 / REV2=IO40 右)
+ *   0 = **暂时关闭** (当前): 控制台 / TCP 送来的**负油门一律按 0 (停) 处理** ⇒ 船不能倒退,
+ *       转向只能靠"两侧推力差"(不能靠一侧反转做原地转向)。
+ *       两路方向线**仍然初始化并保持在 0% (1100µs = 正向半区)** —— 这是 SkyWalker V2
+ *       说明书要求的上电状态, 让它悬空反而有被干扰进"反转半区"的风险; 只是不再往反转半区打。
+ *   1 = 恢复反推: 负油门 = 方向线 100% (反转半区) + 油门线给速度, 见 esc_apply_side()。
+ * ⚠️ 恢复反推还需要电调参数"刹车类型"设为**反推刹车** (出厂默认"无刹车" ⇒ 方向线无效),
+ *    这一步就是"反转需要额外开启"的东西, 暂时不做。 */
+#define REV_ESC_ENABLE      0
+
+/* [总开关] W5500 以太网 + TCP Server (8080 上位机)
+ *   0 = 关停: 不初始化 W5500, 不等 link up, 也不创建 tcp_server_task。
+ *   1 = 启用 (当前): 初始化 + 配静态 IP 192.168.29.10/24 (网关 .1), link up 后串口打印
+ *             IP/掩码/网关; 网线未插则等 30s 超时后继续启动。
+ *             随后创建 tcp_server_task: 监听 8080 收上位机 16B 控制帧驱动电调/滚筒,
+ *             并带 500ms 失联保护 (TCP_LINK_TIMEOUT_MS)。8081 (远端) 未启用。
+ */
+#define W5500_ENABLE        1
 
 /* 闭环自稳测试参数 */
 #define STAB_TARGET_DEG     0.0f    /* 俯仰闭环目标物理角: 0 = 保持水平 */
@@ -570,6 +481,9 @@ static volatile bool s_ch1_test_enabled = false;
  *   - 启动时先做陀螺仪零偏标定, 需保持静止约 1s
  *   - 约定: 模块水平放置且 Z 轴朝上时, roll/pitch ≈ 0
  */
+/* ⚠️ 只在云台 MPU6050 启用时编译该任务: 关停时没人创建它, 留着只会产生
+ *    -Wunused-function 警告 (它引用的 s_att_* 与 Madgwick 函数仍被其它任务使用)。*/
+#if MPU6050_ENABLE
 static void attitude_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "[AHRS] 三维姿态解算任务启动 (%dHz, Madgwick β=%.2f)",
@@ -639,6 +553,16 @@ static void attitude_task(void *pvParameters)
         s_att_az        = m.az;
         s_att_count++;
 
+        /* v8.1: 顺手存一份"原始 6 轴 → int16 LSB"的快照, 供 TCP 任务 20Hz 回传上位机
+         * (换算见上方 s_mpu_raw 注释; 不在这里读第二次 I2C) */
+        s_mpu_raw[0] = (int16_t)(m.ax * 16384.0f);
+        s_mpu_raw[1] = (int16_t)(m.ay * 16384.0f);
+        s_mpu_raw[2] = (int16_t)(m.az * 16384.0f);
+        s_mpu_raw[3] = (int16_t)(m.gx * 131.0f);
+        s_mpu_raw[4] = (int16_t)(m.gy * 131.0f);
+        s_mpu_raw[5] = (int16_t)(m.gz * 131.0f);
+        s_mpu_raw_valid = true;
+
         /* 喂给云台闭环做反馈 (MPU 与云台同一刚体, pitch/yaw 就是物理角)
          * 注: 本循环在零偏标定之后才开始跑, 所以这里喂的必是有效数据 */
         gimbal_feed_attitude(s_att_pitch_deg, s_att_yaw_deg);
@@ -651,52 +575,57 @@ static void attitude_task(void *pvParameters)
         }
     }
 }
+#endif /* MPU6050_ENABLE */
 
-/* [临时测试] GPS 1Hz 日志任务 (用 gps 1 打开 / gps 0 关闭) */
-static void gps_log_task(void *pvParameters)
+/* 惯导 GPS 1Hz 日志任务 (用 gps 1 打开 / gps 0 关闭) —— 数据来自 components/nav */
+#if NAV_ENABLE
+static void nav_gps_log_task(void *pvParameters)
 {
     (void)pvParameters;
-    gps_data_t d;
+    nav_gps_t d;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (!s_gps_log_enabled) {
             continue;
         }
-        if (gps_get_data(&d) != ESP_OK) {
-            continue;
+        if (nav_read_gps(&d) != ESP_OK) {
+            continue;       /* 模块还没数据: 启动日志里已有提示, 输 nav 看统计 */
         }
         uint64_t now = (uint64_t)esp_timer_get_time();
-        uint64_t pps_us = gps_get_pps_last_us();
-        ESP_LOGI(TAG, "[GPS] %s 卫星=%u HDOP=%.1f 经度=%.6f 纬度=%.6f 速度=%.1fkm/h 航向=%.1f",
-                 d.valid ? "定位" : "未定位", (unsigned)d.satellites, d.hdop,
-                 d.longitude, d.latitude, d.speed_kmh, d.course_deg);
-        if (pps_us != 0) {
-            ESP_LOGI(TAG, "[GPS] UTC %02u:%02u:%02u PPS=%lu (最近 %.2fs 前)",
-                     (unsigned)d.hour, (unsigned)d.minute, (unsigned)d.second,
-                     (unsigned long)gps_get_pps_count(),
-                     (double)(now - pps_us) / 1e6);
+
+        ESP_LOGI(TAG, "[GPS] %s 卫星=%u PDOP=%.1f HDOP=%.1f VDOP=%.1f",
+                 d.valid ? "定位" : "未定位", (unsigned)d.satellites, d.pdop, d.hdop, d.vdop);
+        if (d.valid) {
+            ESP_LOGI(TAG, "[GPS] 纬度=%.6f° 经度=%.6f° 速度=%.1fkm/h 航向=%.1f° 海拔=%.1fm",
+                     d.latitude, d.longitude, d.speed_kmh, d.course_deg, d.altitude_m);
+        } else if (d.last_fix_us == 0) {
+            ESP_LOGI(TAG, "[GPS] 未定位 (坐标已清零, 尚未定位成功过)");
+        } else {
+            ESP_LOGI(TAG, "[GPS] 未定位 (坐标已清零, 上次有效定位 %.1fs 前)",
+                     (double)(now - d.last_fix_us) / 1e6);
+        }
+        if (d.time_valid) {
+            ESP_LOGI(TAG, "[GPS] 模块时间 20%02u-%02u-%02u %02u:%02u:%02u",
+                     (unsigned)d.year, (unsigned)d.month, (unsigned)d.day,
+                     (unsigned)d.hour, (unsigned)d.minute, (unsigned)d.second);
         }
     }
 }
 
-/* [临时测试] 船体(亚博) 10 轴 IMU 日志任务: 默认 10Hz 输出, 用 hull 0 关、hull 1 开.
+/* 惯导姿态 10Hz 日志任务 (默认关, 用 hull 1 开 / hull 0 关);
  * 数据全部来自模块内部解算 (含磁力计补偿), 直接给 roll/pitch/yaw。 */
-static void hull_log_task(void *pvParameters)
+static void nav_att_log_task(void *pvParameters)
 {
     (void)pvParameters;
-    imu_data_t d;
+    nav_imu_t d;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (!s_hull_log_enabled) {
             continue;
         }
-        /* 未就绪时静默 (启动日志里已有提示; 插好后输 hull 可在线重试探测) */
-        if (!imu_role_ready(IMU_ROLE_HULL)) {
-            continue;
-        }
-        if (imu_read_role(IMU_ROLE_HULL, &d) != ESP_OK) {
+        if (nav_read_imu(&d) != ESP_OK) {
             continue;
         }
         ESP_LOGI(TAG, "[HULL] rpy=(%+7.2f %+7.2f %+7.2f)  a=(%+6.3f %+6.3f %+6.3f)g  "
@@ -704,6 +633,7 @@ static void hull_log_task(void *pvParameters)
                  d.roll, d.pitch, d.yaw, d.ax, d.ay, d.az, d.gx, d.gy, d.gz, d.temperature);
     }
 }
+#endif /* NAV_ENABLE */
 
 /* ========== [临时测试] 串口标定控制台 (esp_console) ========== */
 
@@ -837,75 +767,95 @@ static int cmd_gimb_status(int argc, char **argv)
         gimbal_get_pid(ch, &pid);
         gimbal_get_fb_sign(ch, &fb);
         printf("%2u  %4s  %7.1f  %6.1f  %+6.1f  %7.1f  %+3.0f  %5.2f  %5.2f  %5.2f\n",
-               (unsigned)ch, st.enabled ? "ON" : "off",
+               (unsigned)ch,
+               !st.enabled ? "off" : (st.nofb ? "N/FB" : "ON"),
                st.target_phys, st.meas_phys, st.err, st.cmd_deg, fb,
                pid.kp, pid.ki, pid.kd);
     }
+    printf("(N/FB = 无姿态反馈: 已停 PID 并回该通道标定中位)\n");
     return 0;
 }
 
-/** gps [0|1] : 查看 GPS 状态; 带参数则开关 1Hz 日志 */
+/** gps [0|1] : 惯导模块的 GPS 快照; 带 0|1 开关 1Hz 日志
+ *  ⚠️ 数据来自惯导模块 (GPS+IMU 一体, 维特 WIT 0x55 协议) 的 0x57/0x58/0x5A 帧,
+ *     **不再是 NMEA**; 所以没有"原始语句回显 / 改波特率 / 发配置语句"这些子命令。 */
 static int cmd_gps(int argc, char **argv)
 {
-    if (!gps_is_ready()) {
-        printf("GPS 未初始化\n");
-        return 1;
-    }
-    if (argc == 2) {
+    /* ---- gps 0|1: 1Hz 日志开关 ---- */
+    if (argc == 2 && (argv[1][0] == '0' || argv[1][0] == '1')) {
         s_gps_log_enabled = (atoi(argv[1]) != 0);
         printf("GPS 日志: %s\n", s_gps_log_enabled ? "开 (1Hz)" : "关");
         return 0;
     }
+    if (argc >= 2) {
+        printf("用法: gps [0|1]    无参打快照, 0|1 开关 1Hz 日志 (模块状态用 nav)\n");
+        return 1;
+    }
 
-    gps_data_t d;
-    if (gps_get_data(&d) != ESP_OK) {
-        printf("读取 GPS 数据失败\n");
+    nav_stats_t st;
+    nav_get_stats(&st);
+    if (!st.ready) {
+        printf("惯导模块无数据: 查 UART2 接线 (ESP32 RX=IO1 <- 模块 TX, TX=IO2 -> 模块 RX)、共地、模块 3.3V\n");
+        printf("   累计字节=%lu 帧OK=%lu 帧错=%lu    (输 nav 看模块配置/波特率)\n",
+               (unsigned long)st.rx_bytes, (unsigned long)st.frames_ok,
+               (unsigned long)st.frames_bad);
+        return 1;
+    }
+
+    nav_gps_t d;
+    if (nav_read_gps(&d) != ESP_OK) {
+        printf("GPS: 模块在线但还没有 GPS 帧 —— 查模块 RSW 是否开了 GPS(0x57)/VELOCITY(0x58)/GSA(0x5A)\n");
         return 1;
     }
     uint64_t now = (uint64_t)esp_timer_get_time();
-    uint64_t pps_us = gps_get_pps_last_us();
 
-    printf("GPS: 定位=%s 卫星=%u HDOP=%.1f 海拔=%.1fm\n",
-           d.valid ? "有效" : "未定位", (unsigned)d.satellites, d.hdop, d.altitude_m);
-    printf("     UTC %02u:%02u:%02u  %04u-%02u-%02u\n",
-           (unsigned)d.hour, (unsigned)d.minute, (unsigned)d.second,
-           (unsigned)d.year, (unsigned)d.month, (unsigned)d.day);
-    printf("     纬度=%.6f° 经度=%.6f°  速度=%.1fkm/h  航向=%.1f°\n",
-           d.latitude, d.longitude, d.speed_kmh, d.course_deg);
-    printf("     PPS=%lu 次", (unsigned long)gps_get_pps_count());
-    if (pps_us != 0) {
-        printf(" (最近 %.2fs 前)", (double)(now - pps_us) / 1e6);
+    printf("GPS: 定位=%s  卫星=%u  PDOP=%.1f HDOP=%.1f VDOP=%.1f\n",
+           d.valid ? "有效" : "未定位", (unsigned)d.satellites, d.pdop, d.hdop, d.vdop);
+    if (d.time_valid) {
+        printf("     模块时间 20%02u-%02u-%02u %02u:%02u:%02u  (TIMEZONE 寄存器默认 UTC+8)\n",
+               (unsigned)d.year, (unsigned)d.month, (unsigned)d.day,
+               (unsigned)d.hour, (unsigned)d.minute, (unsigned)d.second);
+    } else {
+        printf("     模块时间 —  (模块 RSW 未开 TIME(0x50) 帧)\n");
     }
-    printf("  语句=%lu 错误=%lu\n",
-           (unsigned long)d.sentence_cnt, (unsigned long)d.err_cnt);
+
+    if (d.valid) {
+        printf("     纬度=%.6f° 经度=%.6f°  速度=%.1fkm/h  航向=%.1f°  海拔=%.1fm\n",
+               d.latitude, d.longitude, d.speed_kmh, d.course_deg, d.altitude_m);
+    } else {
+        /* ⚠️ 未定位时坐标已被清零 (驱动里不再保留旧值), 这里明确提示 */
+        char ago[48];
+        if (d.last_fix_us == 0) {
+            snprintf(ago, sizeof(ago), "从未定位成功");
+        } else {
+            snprintf(ago, sizeof(ago), "上次有效定位 %.1fs 前",
+                     (double)(now - d.last_fix_us) / 1e6);
+        }
+        printf("     纬度=— 经度=— 速度=— 航向=—  海拔=%.1fm   (%s)\n", d.altitude_m, ago);
+        printf("     => 未定位: 换开阔处并让天线朝天; 卫星数=%u (为 0 说明还没搜到星)\n",
+               (unsigned)d.satellites);
+    }
     return 0;
 }
 
-/** hull [0|1] : 亚博 10 轴 IMU —— 不带参数读一帧(未就绪会先在线重试探测); 带参数开关 10Hz 日志 */
+/** hull [0|1] : 惯导模块的姿态快照 (模块内部解算, 含磁力计补偿);
+ *  不带参数读一帧, 带 0|1 开关 10Hz 日志。数据源: components/nav (WIT 0x53/0x51/0x52 帧) */
 static int cmd_hull(int argc, char **argv)
 {
     if (argc == 2) {
         s_hull_log_enabled = (atoi(argv[1]) != 0);
-        printf("亚博 IMU 日志: %s\n", s_hull_log_enabled ? "开 (10Hz)" : "关");
+        printf("惯导姿态日志: %s\n", s_hull_log_enabled ? "开 (10Hz)" : "关");
         return 0;
     }
-
-    /* 启动时没插上也能救回来: 未就绪就先在线重试一次初始化
-     * (会先试 0x50, 不行就扫总线找 10 轴 IMU 并采用它的实际地址) */
-    if (!imu_role_ready(IMU_ROLE_HULL)) {
-        printf("船体 IMU 未就绪, 正在重新探测...\n");
-        imu_config_t icfg = imu_get_default_config();
-        esp_err_t r = imu_init_role(IMU_ROLE_HULL, &icfg);
-        if (r != ESP_OK || !imu_role_ready(IMU_ROLE_HULL)) {
-            printf("仍未找到: %s   (输 scan 1 看这条总线上有哪些器件)\n", esp_err_to_name(r));
-            return 1;
-        }
-        printf("探测成功\n");
+    if (argc >= 2) {
+        printf("用法: hull [0|1]    无参读一帧, 0|1 开关 10Hz 日志\n");
+        return 1;
     }
 
-    imu_data_t d;
-    if (imu_read_role(IMU_ROLE_HULL, &d) != ESP_OK) {
-        printf("读取失败\n");
+    nav_imu_t d;
+    if (nav_read_imu(&d) != ESP_OK) {
+        printf("惯导模块无姿态数据: 查 UART2 接线 (ESP32 RX=IO1 <- 模块 TX, TX=IO2 -> 模块 RX)、共地、模块 3.3V\n");
+        printf("   接好后不必重启 —— 模块上线后会自动出数据; 输 nav 看帧计数\n");
         return 1;
     }
     printf("rpy=(%+7.2f %+7.2f %+7.2f) deg  a=(%+6.3f %+6.3f %+6.3f) g  "
@@ -914,55 +864,447 @@ static int cmd_hull(int argc, char **argv)
     return 0;
 }
 
-/** scan [0|1] : 扫描 I2C 总线, 列出所有应答地址并识别型号 (不带参数 = 两条都扫) */
-static int cmd_scan(int argc, char **argv)
+/** nav : 惯导模块状态 (在线/配置/波特率/帧统计/两套快照) —— 排查"没数据"第一站 */
+static int cmd_nav(int argc, char **argv)
 {
-    if (argc == 1) {
-        printf("扫描 I2C0 (云台 GPIO16/18)...\n");
-        imu_scan_role(IMU_ROLE_GIMBAL);
-        printf("扫描 I2C1 (船体 + PCA9685 GPIO21/17)...\n");
-        imu_scan_role(IMU_ROLE_HULL);
-        return 0;
+    (void)argc;
+    (void)argv;
+
+    nav_config_t cfg = nav_get_default_config();
+    nav_stats_t  st;
+    nav_get_stats(&st);
+
+    printf("惯导模块 : %s   UART%d: ESP32 RX=IO%d <- 模块 TX, TX=IO%d -> 模块 RX\n",
+           st.ready ? "在线" : "无数据", cfg.uart_num, cfg.rx_gpio, cfg.tx_gpio);
+    printf("波特率   : %lu  (初始 9600, 初始化时自动扫描 9600~230400)\n",
+           (unsigned long)st.baud);
+    printf("输出配置 : RSW=0x%04X (期望 0x%04X)  RRATE=0x%02X (期望 0x%02X)  %s\n",
+           (unsigned)st.rsw, (unsigned)cfg.rsw, (unsigned)st.rrate, (unsigned)cfg.rrate,
+           st.cfg_ok ? "已生效" : "未确认 (稍后自动重试)");
+    printf("累计     : 字节=%lu 帧OK=%lu 帧错=%lu\n",
+           (unsigned long)st.rx_bytes, (unsigned long)st.frames_ok, (unsigned long)st.frames_bad);
+    printf("帧计数   : 时间=%lu 加计=%lu 陀螺=%lu 角度=%lu GPS=%lu 地速=%lu 精度=%lu\n",
+           (unsigned long)st.cnt_time, (unsigned long)st.cnt_acc, (unsigned long)st.cnt_gyro,
+           (unsigned long)st.cnt_angle, (unsigned long)st.cnt_gps, (unsigned long)st.cnt_vel,
+           (unsigned long)st.cnt_dop);
+
+    nav_imu_t im;
+    if (nav_read_imu(&im) == ESP_OK) {
+        printf("姿态     : rpy=(%+7.2f %+7.2f %+7.2f) a=(%+6.3f %+6.3f %+6.3f)g "
+               "g=(%+7.1f %+7.1f %+7.1f)dps T=%.1fC\n",
+               im.roll, im.pitch, im.yaw, im.ax, im.ay, im.az,
+               im.gx, im.gy, im.gz, im.temperature);
+    } else {
+        printf("姿态     : 无数据\n");
     }
 
-    int bus = atoi(argv[1]);
-    if (bus == 0) {
-        imu_scan_role(IMU_ROLE_GIMBAL);
-    } else if (bus == 1) {
-        imu_scan_role(IMU_ROLE_HULL);
+    nav_gps_t gp;
+    bool gp_ok = (nav_read_gps(&gp) == ESP_OK);
+    if (gp_ok) {
+        printf("GPS      : %s 卫星=%u PDOP=%.1f HDOP=%.1f VDOP=%.1f\n",
+               gp.valid ? "定位" : "未定位", (unsigned)gp.satellites, gp.pdop, gp.hdop, gp.vdop);
+        if (gp.valid) {
+            printf("           纬度=%.6f° 经度=%.6f° 速度=%.1fkm/h 航向=%.1f° 海拔=%.1fm\n",
+                   gp.latitude, gp.longitude, gp.speed_kmh, gp.course_deg, gp.altitude_m);
+        }
     } else {
-        printf("用法: scan [0|1]   0=I2C0(云台 GPIO16/18)  1=I2C1(船体+PCA9685 GPIO21/17)\n");
-        return 1;
+        printf("GPS      : 无数据\n");
+    }
+
+    if (!st.ready) {
+        printf("=> 一字节都没收到: 查模块 3.3V/GND 共地、TX-RX 是否交叉 (模块 TX -> IO1)、模块是否上电\n");
+    } else if (!st.cfg_ok) {
+        printf("=> 有数据但配置未确认: 模块 RSW 出厂默认 0x001E (不含 GPS 帧), 见 nav.h; 驱动每 5s 自动重试\n");
+    } else if (gp_ok && !gp.valid) {
+        printf("=> 配置正常但未定位: 天线朝天 + 开阔处; `gps 1` 可开 1Hz 日志观察\n");
     }
     return 0;
 }
 
-/** imu : 两颗 IMU 各读一帧 (云台 MPU6050 原始 6 轴 / 船体 10 轴 IMU 含内部角度) */
+/** scan : 扫描 I2C1 (GPIO16/17), 列出所有应答地址并识别型号
+ *  —— 这条总线上现在是 PCA9685(0x40) + 云台 MPU6050(0x68)。
+ *     ⚠️ 惯导模块走 **UART2**, 不在 I2C 上 (它的状态用 `nav` 查)。 */
+static int cmd_scan(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    printf("扫描 I2C1 (GPIO16/17)...\n");
+    imu_scan_role(IMU_ROLE_GIMBAL);
+    printf("(惯导模块 UART2: ESP32 RX=IO1 <- 模块 TX, TX=IO2 -> 模块 RX)\n");
+    return 0;
+}
+
+/* L298N 最低有效占空比: 低于它电机启动不了 (带载尤其明显) ⇒ |speed| ∈ (0, 60) 一律按 60 下发。
+ * ⚠️ 0 仍然表示"停" —— 不能把 0 也提到 60, 否则永远停不下来。 */
+#define MOTOR_MIN_PCT       60.0f
+
+/**
+ * 设置 L298N 直流电机速度 (-100~100: 正=正转, 负=反转, 0=停; 绝对值 = 占空比 %)
+ * ENA(IO38) 出 5kHz PWM 调速, IN1(IO48)/IN2(IO47) 定方向。
+ * 供 `m` 命令与"裸数字"快捷输入共用。
+ * @param quiet  true = 不打印 (TCP 20Hz 路径; 打印会刷屏)
+ */
+static int motor_apply_speed(float v, bool quiet)
+{
+    if (v >  100.0f) v =  100.0f;
+    if (v < -100.0f) v = -100.0f;
+
+    /* 下限: 1~59 提到 60, -1~-59 压到 -60 (0 不动 = 停) */
+    bool raised = false;
+    if (v > 0.0f && v < MOTOR_MIN_PCT) {
+        v =  MOTOR_MIN_PCT;
+        raised = true;
+    } else if (v < 0.0f && v > -MOTOR_MIN_PCT) {
+        v = -MOTOR_MIN_PCT;
+        raised = true;
+    }
+
+    motor_dir_t dir = MOTOR_DIR_STOP;
+    if (v > 0.0f) {
+        dir = MOTOR_DIR_FORWARD;
+    } else if (v < 0.0f) {
+        dir = MOTOR_DIR_REVERSE;
+    }
+
+    esp_err_t r = motor_set_dc_speed(MOTOR_MAIN_DC, fabsf(v), dir);
+    if (r != ESP_OK) {
+        if (!quiet) printf("L298N 设置失败: %s  (MOTOR_ENABLE=0 时不可用)\n", esp_err_to_name(r));
+        return 1;
+    }
+    if (!quiet) {
+        printf("L298N speed = %+.0f%%  (%s)",
+               (double)v,
+               (dir == MOTOR_DIR_FORWARD) ? "正转" :
+               ((dir == MOTOR_DIR_REVERSE) ? "反转" : "停"));
+        if (raised) {
+            printf("   <- 低于下限 %.0f%%, 已按 %.0f%% 下发", MOTOR_MIN_PCT, MOTOR_MIN_PCT);
+        }
+        printf("\n");
+    }
+    return 0;
+}
+
+/**
+ * m <speed> : L298N 直流电机调速 (控制台快捷入口, 等价于直接输裸数字)
+ *   speed = -100 ~ +100: 正=正转, 负=反转, 0=停 (绝对值 = 占空比 %)
+ *   ⚠️ |speed| < 60 时按 60 下发 (低于 60% 电机转不动); 0 = 停。
+ */
+static int cmd_motor(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: m <speed>   speed = -100~100 (正=正转, 负=反转, 0=停; |speed|<60 按 60 下发)\n");
+        return 1;
+    }
+    return motor_apply_speed((float)atof(argv[1]), /*quiet=*/false);
+}
+
+/* ===== 通道映射: 水上 4 路电调 = 2 路推进 + 2 路反推 =====
+ *   推进: ESC1/ESC2  -> IO41(左) / IO42(右)
+ *   反推: REV1/REV2  -> IO39(左) / IO40(右)
+ *
+ * **负油门自动切换到反推通道**: l 30 = 左推进 30% (IO41), l -30 = 左反推 30% (IO39)。
+ * 单向电调 (SkyWalker V2) 本身不能反向, 所以"反转"靠**独立的反推电调**实现。
+ * ⚠️ 若实测某一路装反了, 把下面成对的 ID/GPIO 对调即可 (纯软件映射, 不用改接线)。 */
+#define ESC_LEFT_ID     MOTOR_ESC_1
+#define ESC_RIGHT_ID    MOTOR_ESC_2
+#define ESC_LEFT_GPIO   41
+#define ESC_RIGHT_GPIO  42
+#define REV_LEFT_ID     MOTOR_THRUST_REV_1
+#define REV_RIGHT_ID    MOTOR_THRUST_REV_2
+#define REV_LEFT_GPIO   39
+#define REV_RIGHT_GPIO  40
+
+/**
+ * 输出一路(左或右)的带符号油门 (SkyWalker V2 反推刹车接线):
+ *   v > 0 → 正转: 油门线给速度 v%, 反推黄线回 0 (正向半区)
+ *   v < 0 → 反转: 反推黄线打到 100% (反转半区), 油门线给速度 |v|%
+ *   v = 0 → 两线都回 0
+ *
+ * ⚠️ 黄线是**方向通道**, 不是油门通道 (好盈 SkyWalker V2 说明书 §06 反推刹车):
+ *    - 通道行程 0-50% (1100~1520µs) = 默认正向, 50%-100% (1520~1940µs) = 反转;
+ *    - 反转速度由**油门线**决定 (触发反转时电调先刹停, 再反转加速到油门量);
+ *    - 上电时黄线必须落在正向半区 (boot 时全通道 1100µs, 已满足)。
+ *    旧实现把黄线当油门映射 (v<0 时发 |v|% ≈ 1380µs, 落在正向半区, 且油门线归零)
+ *    ⇒ 电机永远不反转。现在黄线只发 0/100% 两个方向位, 速度全走油门线。
+ * ⚠️ 切换方向时**先写方向线、再给油门**, 避免油门先于方向导致电机瞬间正向冲一下。
+ * ⚠️ 前提: 电调参数"刹车类型"必须设为**反推刹车**(出厂默认"无刹车", 黄线无效)。
+ * ⚠️ **REV_ESC_ENABLE=0 时整段反推被关掉** (见该宏): 负油门按"停"处理, 方向线不动。
+ * @param quiet  true = 不打印 (TCP 20Hz 路径; 打印会刷屏)
+ */
+static int esc_apply_side(bool is_left, float v, bool quiet)
+{
+    const char *side     = is_left ? "左" : "右";
+    motor_id_t  fwd_id   = is_left ? ESC_LEFT_ID   : ESC_RIGHT_ID;
+    motor_id_t  rev_id   = is_left ? REV_LEFT_ID   : REV_RIGHT_ID;
+    int         fwd_gpio = is_left ? ESC_LEFT_GPIO  : ESC_RIGHT_GPIO;
+    int         rev_gpio = is_left ? REV_LEFT_GPIO  : REV_RIGHT_GPIO;
+
+    if (v >  100.0f) v =  100.0f;
+    if (v < -100.0f) v = -100.0f;
+
+    /* 反推暂时关闭 (REV_ESC_ENABLE=0): 负油门在这里就改成 0 ⇒ 下面的 v<0 分支实际到不了,
+     * 方向线只会在 1100µs (正向半区) 待着。
+     * (打开反推时 rev_off 恒为 false, 下面那条提示不会出现, 行为与旧版完全一致) */
+    bool rev_off = false;
+#if !REV_ESC_ENABLE
+    if (v < 0.0f) { v = 0.0f; rev_off = true; }
+#endif
+
+    esp_err_t r;
+    if (v > 0.0f) {
+        r = motor_set_esc_throttle(rev_id, 0.0f);          /* 方向线回正向半区 */
+        if (r == ESP_OK) r = motor_set_esc_throttle(fwd_id, v);
+        if (r != ESP_OK) {
+            if (!quiet) printf("%s电调未就绪 (油门 IO%d / 方向 IO%d): %s\n",
+                               side, fwd_gpio, rev_gpio, esp_err_to_name(r));
+            return 1;
+        }
+        if (!quiet) printf("%s: 推进 %+.0f%%   (油门 IO%d, 方向 IO%d 正向)\n",
+                           side, (double)v, fwd_gpio, rev_gpio);
+    } else if (v < 0.0f) {
+        r = motor_set_esc_throttle(rev_id, 100.0f);        /* 方向线打进反转半区 */
+        if (r == ESP_OK) r = motor_set_esc_throttle(fwd_id, -v);  /* 油门线给速度 */
+        if (r != ESP_OK) {
+            if (!quiet) printf("%s电调未就绪 (油门 IO%d / 方向 IO%d): %s\n",
+                               side, fwd_gpio, rev_gpio, esp_err_to_name(r));
+            return 1;
+        }
+        if (!quiet) printf("%s: 反推 %+.0f%%   (油门 IO%d 给速度, 方向 IO%d 反转)\n",
+                           side, (double)(-v), fwd_gpio, rev_gpio);
+    } else {
+        r = motor_set_esc_throttle(fwd_id, 0.0f);
+        if (r == ESP_OK) r = motor_set_esc_throttle(rev_id, 0.0f);
+        if (r != ESP_OK) {
+            if (!quiet) printf("%s电调未就绪 (油门 IO%d / 方向 IO%d): %s\n",
+                               side, fwd_gpio, rev_gpio, esp_err_to_name(r));
+            return 1;
+        }
+        if (!quiet) {
+            if (rev_off) {
+                printf("%s: 反推已关闭 (REV_ESC_ENABLE=0) ⇒ 按停处理 (油门 IO%d 已回零)\n",
+                       side, fwd_gpio);
+            } else {
+                printf("%s: 停          (油门 IO%d / 方向 IO%d 都已回零)\n",
+                       side, fwd_gpio, rev_gpio);
+            }
+        }
+    }
+    return 0;
+}
+
+/** l <v> : 左路带符号油门, v = -100~100 (正=左推进 IO41, 负=左反推 IO39, 0=停) */
+static int cmd_esc_l(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: l <-100~100>   正=左推进 (IO%d), 负=左反推 (IO%d), 0=停\n",
+               ESC_LEFT_GPIO, REV_LEFT_GPIO);
+        return 1;
+    }
+    return esc_apply_side(true, (float)atof(argv[1]), /*quiet=*/false);
+}
+
+/** r <v> : 右路带符号油门, v = -100~100 (正=右推进 IO42, 负=右反推 IO40, 0=停) */
+static int cmd_esc_r(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: r <-100~100>   正=右推进 (IO%d), 负=右反推 (IO%d), 0=停\n",
+               ESC_RIGHT_GPIO, REV_RIGHT_GPIO);
+        return 1;
+    }
+    return esc_apply_side(false, (float)atof(argv[1]), /*quiet=*/false);
+}
+
+/** 裸数字: 左右同时给同一个带符号油门 (两路一起试) */
+static void esc_apply_both(int v)
+{
+    esc_apply_side(true,  (float)v, /*quiet=*/false);
+    esc_apply_side(false, (float)v, /*quiet=*/false);
+}
+
+/**
+ * 把通道名解析成 ID / 中文侧名 / 引脚。供 cal / pw 这类**逐通道**调试命令使用
+ * (油门不用它 —— 油门靠 l/r 的负号自动切换, 见 esc_apply_side)。
+ *   l  / left    左推进 (IO41)
+ *   r  / right   右推进 (IO42)
+ *   bl / bleft   左反推 (IO39)
+ *   br / bright  右反推 (IO40)
+ */
+static bool esc_resolve_side(const char *arg, motor_id_t *id, const char **side, int *gpio)
+{
+    if (strcmp(arg, "l")  == 0 || strcmp(arg, "left")   == 0) {
+        *id = ESC_LEFT_ID;  *side = "左推进"; *gpio = ESC_LEFT_GPIO;  return true;
+    }
+    if (strcmp(arg, "r")  == 0 || strcmp(arg, "right")  == 0) {
+        *id = ESC_RIGHT_ID; *side = "右推进"; *gpio = ESC_RIGHT_GPIO; return true;
+    }
+    if (strcmp(arg, "bl") == 0 || strcmp(arg, "bleft")  == 0) {
+        *id = REV_LEFT_ID;  *side = "左反推"; *gpio = REV_LEFT_GPIO;  return true;
+    }
+    if (strcmp(arg, "br") == 0 || strcmp(arg, "bright") == 0) {
+        *id = REV_RIGHT_ID; *side = "右反推"; *gpio = REV_RIGHT_GPIO; return true;
+    }
+    return false;
+}
+
+/* ===== 电调脉宽人工测定 (pw 定点) =====
+ * 用途: 手动逐点逼近电调**真实的脉宽阈值** —— 例如找"从哪一档开始转"。
+ * ⚠️ 高端点 (满油门) 用这个测不出: 90% 与 100% 的转速/声音差别极小,
+ *    要确认"100 是真 100"请用 `cal` 行程标定, 或上电流表/转速表。
+ * ⚠️ 输出较大脉宽时电机会真的转起来, 务必先拆桨。 */
+
+/** pw <l|r|bl|br> <us> : 直接输出指定脉宽 (500~2500 µs), 人工测定端点用 */
+static int cmd_pw(int argc, char **argv)
+{
+    if (argc < 3) {
+        printf("用法: pw <l|r|bl|br> <us>    直接输出脉宽 (500~2500 us)\n");
+        printf("      l=左推进(IO%d) r=右推进(IO%d) bl=左反推(IO%d) br=右反推(IO%d)\n",
+               ESC_LEFT_GPIO, ESC_RIGHT_GPIO, REV_LEFT_GPIO, REV_RIGHT_GPIO);
+        printf("      油门区间 1141~1940 us; 1135 及以下是停; 1136~1140 为迟滞带\n");
+        printf("      ⚠️ 上限还受帧周期限制 (周期 = 1/帧率), 超过会被拒绝\n");
+        return 1;
+    }
+
+    motor_id_t id; const char *side; int gpio;
+    if (!esc_resolve_side(argv[1], &id, &side, &gpio)) {
+        printf("通道只能是 l / r / bl / br\n");
+        return 1;
+    }
+
+    int us = atoi(argv[2]);
+    if (us < 500 || us > 2500) {
+        printf("脉宽请给 500~2500 us\n");
+        return 1;
+    }
+
+    esp_err_t r = motor_set_esc_pulse_us(id, (uint32_t)us);
+    if (r != ESP_OK) {
+        printf("%s (IO%d) 设置失败: %s\n", side, gpio, esp_err_to_name(r));
+        if (r == ESP_ERR_INVALID_ARG) {
+            printf("  (脉宽超出可表示范围: 500 ~ min(2500, 帧周期); 当前帧率见 motor.c 的 MOTOR_ESC_FREQ_HZ)\n");
+        }
+        return 1;
+    }
+
+    /* 按实测阈值给出解读 (迟滞特性: 1136~1140 只在"已在转"时维持, 冷态启动不了) */
+    printf("%s (IO%d) 脉宽 = %d us", side, gpio, us);
+    if (us <= 1100) {
+        printf("   (<= 停机点 1100us: 停, 且是上电解锁位)\n");
+    } else if (us <= 1135) {
+        printf("   (<= 停止点 1135us: 停)\n");
+    } else if (us < 1141) {
+        printf("   (1136~1140 迟滞带: 已在转可维持, 冷态启动不了)\n");
+    } else if (us >= 1940) {
+        printf("   (>= 上限 1940us: 全速)\n");
+    } else {
+        printf("   (按 1141~1940 映射约 %.0f%% 油门)\n",
+               (double)(us - 1141) * 100.0 / (1940.0 - 1141.0));
+    }
+    return 0;
+}
+
+/* ==================== 电调油门行程标定 (好盈 SkyWalker V2 官方流程) ====================
+ *
+ * 官方《油门行程校准操作方法》:
+ *   1) 遥控器油门打到**最高点**
+ *   2) 电调接电池 -> 马达"123"提示音 (上电正常)
+ *   3) N 声短鸣 = 锂电节数
+ *   4) "哗-哗-" 双短鸣 = **最高点校准成功**
+ *   5) **5 秒内**把油门推到最低, 等待 1 秒 = 最低点校准成功
+ *   6) 一声长鸣 "哗——" = 系统就绪
+ *
+ * ⚠️ 第 5 步是硬性的 5 秒窗口, 而 ESP32 **听不到电调的鸣叫**, 无法用固定延时自动卡点
+ *    (延时长于 5s 会超时失败, 短于电调上电自检时间又会提前降油门)。
+ *    所以拆成**手动两步**: `cal l` 先输出最高油门并保持, 你听到双短鸣后立刻敲 `cal2`。
+ *
+ * 标定完成后, 程序的 100% 就是这台电调认定的最高点 (定义上相等)。 */
+static motor_id_t  s_cal_id   = MOTOR_MAX;   /* 正在标定的通道 (MOTOR_MAX = 无) */
+static int         s_cal_gpio = -1;
+static const char *s_cal_side = "";
+
+/** cal <l|r|bl|br> : 行程标定第 1 步 —— 输出并保持最高油门, 等电调确认最高点 */
+static int cmd_esc_cal(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("用法: cal <l|r|bl|br>   电调油门行程标定第 1 步 (先断电, 再上电, 听双短鸣)\n");
+        printf("      l=左推进(IO%d) r=右推进(IO%d) bl=左反推(IO%d) br=右反推(IO%d)\n",
+               ESC_LEFT_GPIO, ESC_RIGHT_GPIO, REV_LEFT_GPIO, REV_RIGHT_GPIO);
+        return 1;
+    }
+    motor_id_t id; const char *side; int gpio;
+    if (!esc_resolve_side(argv[1], &id, &side, &gpio)) {
+        printf("通道只能是 l / r / bl / br\n");
+        return 1;
+    }
+
+    esp_err_t r = motor_set_esc_throttle(id, 100.0f);
+    if (r != ESP_OK) {
+        printf("%s (IO%d) 输出失败: %s  (通道未配置时不可用)\n",
+               side, gpio, esp_err_to_name(r));
+        return 1;
+    }
+
+    s_cal_id   = id;
+    s_cal_gpio = gpio;
+    s_cal_side = side;
+
+    printf("\n=== %s (IO%d) 行程标定 · 第 1/2 步 ===\n", side, gpio);
+    printf("已输出**最高油门 100%% (1940us) 并保持**。现在请:\n");
+    printf("  [1] 先给电调断电 (拔电池)\n");
+    printf("  [2] 再给电调上电 —— 会听到 \"123\" 上电音 -> N 声短鸣(电池节数)\n");
+    printf("  [3] 听到 \"哗-哗-\" **双短鸣** = 最高点已确认\n");
+    printf("  [4] 听到双短鸣后 **立刻** 输入:  cal2\n");
+    printf("⚠️ 双短鸣后 5 秒内必须降到最低油门, 所以听到就马上敲 cal2 (别先按回车空行)\n");
+    printf("⚠️ 标定期间请不要输 l / r / pw / 裸数字, 会打断\n\n");
+    return 0;
+}
+
+/** cal2 : 行程标定第 2 步 —— 降到最低油门, 完成标定 */
+static int cmd_esc_cal2(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (s_cal_id == MOTOR_MAX) {
+        printf("还没开始标定。请先输入: cal <l|r|bl|br>\n");
+        return 1;
+    }
+
+    motor_id_t  id   = s_cal_id;
+    const char *side = s_cal_side;
+    int         gpio = s_cal_gpio;
+    s_cal_id = MOTOR_MAX;      /* 无论成败都结束本轮, 避免误用 */
+
+    esp_err_t r = motor_set_esc_throttle(id, 0.0f);
+    if (r != ESP_OK) {
+        printf("%s (IO%d) 输出失败: %s\n", side, gpio, esp_err_to_name(r));
+        return 1;
+    }
+
+    printf("\n=== %s (IO%d) 行程标定 · 第 2/2 步 ===\n", side, gpio);
+    printf("已降到**最低油门 0%% (1100us)** 并保持\n");
+    printf("  -> 听到一声长鸣 \"哗——\" = 最低点校准成功, 标定完成\n");
+    printf("  -> 之后上电应听到: \"123\" + N 声短鸣 + 一声长鸣 (正常就绪)\n");
+    printf("=== 标定结束, 该通道当前为 0 (停) ===\n\n");
+    return 0;
+}
+
+/** imu : 读一帧云台 MPU6050 (原始 6 轴; 姿态由上层 Madgwick 解算)
+ *  ⚠️ 船体姿态/惯导数据不在本命令里 —— 已由惯导模块提供, 用 `hull` 或 `nav`。 */
 static int cmd_imu(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
 
-    for (int r = 0; r < IMU_ROLE_COUNT; r++) {
-        imu_role_t  role = (imu_role_t)r;
-        const char *name = (role == IMU_ROLE_HULL) ? "hull  " : "gimbal";
-
-        if (!imu_role_ready(role)) {
-            printf("%s  未就绪\n", name);
-            continue;
-        }
-        imu_data_t d;
-        if (imu_read_role(role, &d) != ESP_OK) {
-            printf("%s  读取失败\n", name);
-            continue;
-        }
-        printf("%s  a=(%+7.3f %+7.3f %+7.3f) g  g=(%+8.1f %+8.1f %+8.1f) dps",
-               name, d.ax, d.ay, d.az, d.gx, d.gy, d.gz);
-        if (role == IMU_ROLE_HULL) {
-            printf("  rpy=(%+7.1f %+7.1f %+7.1f) deg", d.roll, d.pitch, d.yaw);
-        }
-        printf("  T=%.1f C\n", d.temperature);
+    if (!imu_role_ready(IMU_ROLE_GIMBAL)) {
+        printf("gimbal  未就绪 (云台 MPU6050 未接, 或 MPU6050_ENABLE=0)\n");
+        return 1;
     }
+    imu_data_t d;
+    if (imu_read_role(IMU_ROLE_GIMBAL, &d) != ESP_OK) {
+        printf("gimbal  读取失败\n");
+        return 1;
+    }
+    printf("gimbal  a=(%+7.3f %+7.3f %+7.3f) g  g=(%+8.1f %+8.1f %+8.1f) dps  T=%.1f C\n",
+           d.ax, d.ay, d.az, d.gx, d.gy, d.gz, d.temperature);
     return 0;
 }
 
@@ -989,6 +1331,60 @@ static int cmd_pulse(int argc, char **argv)
         return 1;
     }
     printf("ch%d -> %d us\n", ch, us);
+    return 0;
+}
+
+/** g <ch> [deg] : **按角度**控制云台 (v6.1 新增)
+ *  与 `p`(脉宽) 的分工:
+ *    · `g` 走 servo_set_angle() —— 按**标称角**下发, **受"标定 + 软件行程限位"约束**
+ *      (ch1 出厂限位 30~150°, 越界会被钳住);
+ *    · `p` 走 servo_set_pulse_us() —— 直接定脉宽, **绕过限位**, 测机械行程/端点时用它。
+ *  不带 deg 参数 = 只查询当前角度/脉宽/可用窗口, 不动作。 */
+static int cmd_goto(int argc, char **argv)
+{
+    if (argc < 2 || argc > 3) {
+        printf("用法: g <ch> [deg]   例: g 1 120  (不带 deg = 查当前角度)\n");
+        return 1;
+    }
+    int ch = atoi(argv[1]);
+    if (ch < 0 || ch >= SERVO_CHANNEL_COUNT) {
+        printf("通道越界 (0~%d)\n", SERVO_CHANNEL_COUNT - 1);
+        return 1;
+    }
+    if (!servo_is_ready()) {
+        printf("PCA9685 未就绪 (SERVO_ENABLE=0 或硬件异常)\n");
+        return 1;
+    }
+
+    float lo = 0.0f, hi = 0.0f;
+    servo_get_limit((uint8_t)ch, &lo, &hi);
+
+    if (argc == 2) {                     /* 只查询, 不动作 */
+        float    cur = 0.0f;
+        uint16_t us  = 0;
+        servo_get_angle((uint8_t)ch, &cur);
+        servo_get_pulse_us((uint8_t)ch, &us);
+        printf("ch%d 当前 %.1f° (可用 %.0f~%.0f°, %u us)\n", ch, cur, lo, hi, us);
+        return 0;
+    }
+
+    float deg = (float)atof(argv[2]);
+    esp_err_t ret = servo_set_angle((uint8_t)ch, deg);
+    if (ret != ESP_OK) {
+        printf("失败: %s\n", esp_err_to_name(ret));
+        return 1;
+    }
+
+    float    act = 0.0f;
+    uint16_t us  = 0;
+    servo_get_angle((uint8_t)ch, &act);
+    servo_get_pulse_us((uint8_t)ch, &us);
+    if (fabsf(act - deg) > 0.05f) {
+        printf("ch%d -> 请求 %.1f°, 实际 %.1f° (被软件限位 %.0f~%.0f° 钳住, %u us)\n",
+               ch, deg, act, lo, hi, us);
+    } else {
+        printf("ch%d -> %.1f° (%u us)\n", ch, act, us);
+    }
     return 0;
 }
 
@@ -1209,18 +1605,36 @@ static int cmd_test1(int argc, char **argv)
     return 0;
 }
 
+/** 纯整数判定 (允许前导 + / -), 供控制台"裸数字"快捷输入识别 */
+static bool is_int_str(const char *s)
+{
+    if (s == NULL || *s == '\0') return false;
+    if (*s == '+' || *s == '-') s++;
+    if (*s == '\0') return false;
+    for (; *s != '\0'; s++) {
+        if (*s < '0' || *s > '9') return false;
+    }
+    return true;
+}
+
 /**
  * @brief 自定义串口 REPL 任务
  *
- * 与 esp_console 自带 REPL 唯一的区别: 纯数字输入直接解释为 "把 ch0 定死在该脉宽",
- * 省去每次改脉宽都要重新编译烧录. 其余输入照常交给 esp_console_run 处理.
+ * 与 esp_console 自带 REPL 唯一的区别: 纯整数输入走"快捷通道", 省去每次都要打命令名。
+ * PCA9685 关停期间 (SERVO_ENABLE=0) 裸数字 = **左右电调同时给 0~100 油门**;
+ * PCA9685 启用时裸数字 = **ch0 脉宽 100~3000us** (原行为)。
+ * 其余输入照常交给 esp_console_run 处理.
  */
 static void console_repl_task(void *pvParameters)
 {
     linenoiseSetMaxLineLen(128);
 
     printf("\n");
-    printf("直接输入数字 = 把 ch0 定死在该脉宽 (例: 500)\n");
+#if SERVO_ENABLE
+    printf("直接输入数字 (100~3000) = 把 ch0 定死在该脉宽 (us)\n");
+#else
+    printf("直接输入数字 (-100~100) = 左右同时 (正=推进, 负=反推); l <v> 只动左, r <v> 只动右\n");
+#endif
     printf("输入 help 查看全部指令\n");
 
     while (1) {
@@ -1234,16 +1648,9 @@ static void console_repl_task(void *pvParameters)
         }
         linenoiseHistoryAdd(line);
 
-        /* 判断是否"纯数字" */
-        bool is_number = true;
-        for (const char *p = line; *p != '\0'; p++) {
-            if (*p < '0' || *p > '9') {
-                is_number = false;
-                break;
-            }
-        }
-
-        if (is_number) {
+        /* 纯整数 (可带 +/-) → 快捷通道 */
+        if (is_int_str(line)) {
+#if SERVO_ENABLE
             int us = atoi(line);
             if (us < 100 || us > 3000) {
                 printf("脉宽请给 100~3000 us\n");
@@ -1255,6 +1662,15 @@ static void console_repl_task(void *pvParameters)
                     printf("设置失败: %s\n", esp_err_to_name(r));
                 }
             }
+#else
+            /* PCA9685 关停 ⇒ ch0 脉宽没意义; 本轮测试对象是 4 路电调 ⇒ 裸数字 = 左右同时 (带符号) */
+            int t = atoi(line);
+            if (t < -100 || t > 100) {
+                printf("电调油门请给 -100~100 (正=推进, 负=反推; 左右单独控制用 l <v> / r <v>)\n");
+            } else {
+                esc_apply_both(t);
+            }
+#endif
         } else {
             int ret = 0;
             esp_err_t err = esp_console_run(line, &ret);
@@ -1272,6 +1688,315 @@ static void console_repl_task(void *pvParameters)
     }
 }
 
+/* ============================================================
+ *  TCP 服务器 (v5.12) —— 上位机内网操控, 仅 8080
+ * ============================================================ */
+
+/** 云台手动指令 (上位机 cmd=0x12 SERVO) → 舵机。
+ *
+ * 掩码置位的通道按**标称角**下发 (`servo_set_angle()`), 受"标定 + 软件行程限位"约束
+ * (ch1 出厂 30~150°, 越界自动钳住) —— 与控制台 `g` 命令走同一条路, 只是值来自网络。
+ * ⚠️ **只在角度变化时才写 I2C**: 拖动条会连发同一个值, 重复写没有意义还占总线。
+ * ⚠️ 失败只打印一次 (避免 20Hz 刷屏), 成功一次后重新武装。
+ * ⚠️ 与云台闭环互斥: `ge <ch> 1` 开着时闭环每周期也会写同一通道, 二者会互相抢 ——
+ *    要手动摆位请先确认该通道闭环是关的 (当前 `MPU6050_ENABLE=0`, 闭环也没有反馈源)。
+ */
+static void servo_apply_from_host(const ctrl_command_t *cmd)
+{
+#if SERVO_ENABLE
+    static float s_last_deg[2]   = { 1e9f, 1e9f };   /* 上次下发的目标角 (哨兵值: 首次必下发) */
+    static bool  s_err_logged[2] = { false, false };
+
+    for (int ch = 0; ch < 2; ch++) {
+        if (!(cmd->servo_mask & (1u << ch))) continue;       /* 掩码未置位: 该通道不动 */
+
+        float deg = (float)cmd->servo_deg10[ch] / 10.0f;
+        if (deg == s_last_deg[ch]) continue;                 /* 值没变: 不重复写总线 */
+        s_last_deg[ch] = deg;
+
+        esp_err_t r = servo_set_angle((uint8_t)ch, deg);
+        if (r == ESP_OK) {
+            s_err_logged[ch] = false;
+        } else if (!s_err_logged[ch]) {
+            s_err_logged[ch] = true;
+            ESP_LOGW("TCP", "云台 ch%d 目标 %.1f° 下发失败: %s (SERVO_ENABLE=0 或 PCA9685 未就绪?)",
+                     ch, (double)deg, esp_err_to_name(r));
+        }
+    }
+#else
+    (void)cmd;
+#endif
+}
+
+/** 上位机控制帧 → 本地动作。**静默执行** —— TCP 20Hz, 打印会刷爆串口。
+ *
+ * ① cmd=0x10 MOTOR — 差速混合 (与参数总览 §2 一致):
+ *   left  = clamp(speed + yaw, -100, +100) → 正=左推进 IO41 / 负=左反推 IO39
+ *   right = clamp(speed - yaw, -100, +100) → 正=右推进 IO42 / 负=右反推 IO40
+ *   bucket_speed (-100~100)                → L298N 滚筒收放电机 (IO38/48/47)
+ * ② cmd=0x12 SERVO — 云台手动 (v9.2): 掩码置位的通道按标称角摆位, 见 servo_apply_from_host()。
+ * ⚠️ 500ms 失联保护只把**电机**归零, 舵机保持最后位置 (PCA9685 自己维持 PWM)。 */
+static void tcp_apply_local_command(const ctrl_command_t *cmd)
+{
+    /* 云台手动 (cmd=0x12): 与电机无关, 单独处理 */
+    if (cmd->cmd == CTRL_CMD_SERVO) {
+        servo_apply_from_host(cmd);
+        return;
+    }
+
+    int left  = (int)cmd->speed + (int)cmd->yaw;
+    int right = (int)cmd->speed - (int)cmd->yaw;
+    if (left  >  100) left  =  100;
+    if (left  < -100) left  = -100;
+    if (right >  100) right =  100;
+    if (right < -100) right = -100;
+
+    esc_apply_side(true,  (float)left,  /*quiet=*/true);
+    esc_apply_side(false, (float)right, /*quiet=*/true);
+    motor_apply_speed((float)cmd->bucket_speed, /*quiet=*/true);
+}
+
+/**
+ * 失联保护: 已连接且收到过控制帧, 但超过 TCP_LINK_TIMEOUT_MS 没有新帧
+ * ⇒ 4 路电调 + L298N 全部归零, 并解除武装 (等下一帧重新计时)。
+ *
+ * 为什么需要: 没有它的话, 上位机崩溃 / 网线松掉会让船**保持最后一条指令**一直冲出去。
+ * 上位机正常按 20Hz 下发, 500ms = 连续丢 10 帧, 足以区分"网络抖动"与"真失联"。
+ */
+static void tcp_check_link_timeout(void)
+{
+    if (!s_host_connected || s_last_ctrl_us == 0) return;
+
+    int64_t age_ms = (esp_timer_get_time() - s_last_ctrl_us) / 1000;
+    if (age_ms <= TCP_LINK_TIMEOUT_MS) return;
+
+    esc_apply_side(true,  0.0f, /*quiet=*/true);
+    esc_apply_side(false, 0.0f, /*quiet=*/true);
+    motor_apply_speed(0.0f, /*quiet=*/true);
+    s_last_ctrl_us = 0;   /* 只触发一次, 收到新帧才重新计时 */
+    ESP_LOGW("TCP", "上位机失联 >%d ms ⇒ 已全部停机 (推进/反推/滚筒归零)", TCP_LINK_TIMEOUT_MS);
+}
+
+/**
+ * 状态回传 ①: **透传**收到的 0xBB 0x66 帧给上位机 (type 原样保留)。
+ *
+ * `control` 组的 handle_mpu_frame() 每收到一条状态帧就调这里 —— 走的正是
+ * "远端 (8081) → 主控 → 上位机" 这条路 (type=0x02 远端 MPU / type=0x03 v3.0 沉浮状态)。
+ * ⚠️ 8081 远端转发当前未启用, 所以实际不会有帧进来; 实现留着即"到货就能用"。
+ */
+void tcp_server_forward_mpu_to_host(const ctrl_mpu_data_t *m)
+{
+    if (!s_host_connected) return;
+
+    uint8_t f[CTRL_MPU_FRAME_SIZE];
+    control_build_mpu_frame(f, m->type, m->ax, m->ay, m->az, m->gx, m->gy, m->gz);
+    wiz_send(HOST_SOCK, f, sizeof(f));
+}
+
+/** 状态回传 ②: **主控自己**那颗云台 MPU6050 的原始 6 轴, 20Hz 发给上位机 (type=0x01) */
+static void tcp_poll_send_local_mpu(void)
+{
+    if (!s_host_connected) {
+        s_mpu_next_us = 0;          /* 断开 → 重连后立刻发第一条 */
+        return;
+    }
+    if (!s_mpu_raw_valid) return;   /* MPU 未就绪/未解算: 不发 (上位机面板显示 --) */
+
+    int64_t now = esp_timer_get_time();
+    if (s_mpu_next_us == 0)  s_mpu_next_us = now;
+    if (now < s_mpu_next_us) return;
+    s_mpu_next_us = now + MPU_PUSH_PERIOD_US;
+
+    uint8_t f[CTRL_MPU_FRAME_SIZE];
+    control_build_mpu_frame(f, CTRL_MPU_TYPE_LOCAL,
+                            s_mpu_raw[0], s_mpu_raw[1], s_mpu_raw[2],
+                            s_mpu_raw[3], s_mpu_raw[4], s_mpu_raw[5]);
+    int32_t n = wiz_send(HOST_SOCK, f, sizeof(f));
+    if (n < 0) {
+        ESP_LOGW("TCP", "主控 MPU 帧发送失败 (n=%d)", (int)n);
+    }
+}
+
+/* ========== GPS 状态回传 (v9.1) ==========
+ * 上位机「GPS」面板收两个 16B 状态帧, 各 **2Hz**:
+ *   type=0x04 定位 (纬度/经度/海拔/卫星数/flags)
+ *   type=0x05 运动+精度+时间 (航向/地速/P·H·V DOP/模块时间/flags)
+ * 布局见 control.h 顶部注释。数据源是惯导模块 (components/nav) 快照 ——
+ * `nav_read_gps()` 只是加锁拷结构体、不碰 UART, 所以在 TCP 任务里直接读没问题
+ * (模块没 GPS 帧时**一帧都不发**, 上位机面板保持 `--`)。 */
+#if NAV_ENABLE
+#define GPS_PUSH_PERIOD_US    500000     /* 2Hz */
+static int64_t s_gps_next_us = 0;
+
+/** DOP (float, 典型 0.5~50) → 上报用的 uint8 (×0.1); 超出 25.5 截顶 */
+static uint8_t dop_to_u8(float v)
+{
+    if (!(v > 0.0f)) return 0;          /* 含 NaN / 负数 */
+    if (v >= 25.5f)  return 255;
+    return (uint8_t)(v * 10.0f + 0.5f);
+}
+
+/** 状态回传 ③: 惯导模块的 GPS 快照, 2Hz 发给上位机 (type=0x04 + 0x05) */
+static void tcp_poll_send_gps(void)
+{
+    if (!s_host_connected) {
+        s_gps_next_us = 0;              /* 断开 → 重连后立刻发第一条 */
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (s_gps_next_us == 0) s_gps_next_us = now;
+    if (now < s_gps_next_us) return;
+    s_gps_next_us = now + GPS_PUSH_PERIOD_US;
+
+    nav_gps_t d;
+    if (nav_read_gps(&d) != ESP_OK) return;   /* 模块无 GPS 帧: 不发 */
+
+    uint8_t flags = 0;
+    if (d.valid)      flags |= CTRL_GPS_FLAG_FIX;
+    if (d.time_valid) flags |= CTRL_GPS_FLAG_TIME;
+
+    uint8_t f[CTRL_MPU_FRAME_SIZE];
+    control_build_gps_pos_frame(f, flags,
+        (int32_t)lround(d.latitude  * 1e7),      /* double: 用 lround, float 存不下 3e8 的整数 */
+        (int32_t)lround(d.longitude * 1e7),
+        (int16_t)lroundf(d.altitude_m * 10.0f),
+        (uint8_t)(d.satellites > 255 ? 255 : d.satellites));
+    wiz_send(HOST_SOCK, f, sizeof(f));
+
+    control_build_gps_nav_frame(f, flags,
+        (uint16_t)lroundf(d.course_deg * 100.0f),
+        (uint16_t)lroundf(d.speed_kmh  * 100.0f),
+        dop_to_u8(d.pdop), dop_to_u8(d.hdop), dop_to_u8(d.vdop),
+        d.hour, d.minute, d.second);
+    wiz_send(HOST_SOCK, f, sizeof(f));
+}
+#endif  /* NAV_ENABLE */
+
+/** 处理 socket 0 (8080 上位机): listen → 接收 → 解析 → 断线重建 */
+static void tcp_handle_host_socket(void)
+{
+    uint8_t sr = getSn_SR(HOST_SOCK);
+    int32_t n;
+
+    switch (sr) {
+    case SOCK_ESTABLISHED:
+        if (!s_host_connected) {
+            s_host_connected = true;
+            s_last_ctrl_us   = 0;      /* 等第一条控制帧才开始计时 */
+            control_reset();           /* 清空上次连接的残帧 */
+            ESP_LOGI("TCP", "[HOST] 上位机已连接 (8080)");
+        }
+        n = wiz_recv(HOST_SOCK, s_rx_buffer, sizeof(s_rx_buffer));
+        if (n > 0) {
+            if (control_process(s_rx_buffer, (size_t)n) > 0) {
+                s_ctrl_frames++;
+            }
+            s_last_ctrl_us = esp_timer_get_time();   /* 收到数据 → 喂失联保护的狗 */
+        } else if (n == SOCK_BUSY) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        } else {
+            ESP_LOGI("TCP", "[HOST] 上位机已断开 (n=%d)", (int)n);
+            wiz_close(HOST_SOCK);
+            s_host_connected = false;
+            s_last_ctrl_us   = 0;
+        }
+        break;
+
+    case SOCK_CLOSE_WAIT:
+    case SOCK_CLOSED:
+        if (s_host_connected) {
+            ESP_LOGI("TCP", "[HOST] 连接关闭 (SR=0x%02X), 重新监听 8080", sr);
+        }
+        s_host_connected = false;
+        s_last_ctrl_us   = 0;
+        wiz_close(HOST_SOCK);
+        if (wiz_socket(HOST_SOCK, Sn_MR_TCP, TCP_HOST_PORT, SF_TCP_NODELAY) == (int8_t)HOST_SOCK) {
+            wiz_listen(HOST_SOCK);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        break;
+
+    default:
+        vTaskDelay(pdMS_TO_TICKS(10));
+        break;
+    }
+}
+
+/**
+ * TCP 服务器任务 (仅 socket 0 = 8080 上位机)。
+ * 8081 (远端 ESP32-S3 水下节点) 暂未启用 —— 见文件头说明, 设计在参数总览 §2。
+ */
+static void tcp_server_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    /* 注册本地指令回调: control 只解析协议, 电机动作由上面的回调执行 */
+    control_set_local_callback(tcp_apply_local_command);
+
+    if (wiz_socket(HOST_SOCK, Sn_MR_TCP, TCP_HOST_PORT, SF_TCP_NODELAY) != HOST_SOCK) {
+        ESP_LOGE("TCP", "socket 0 (8080) 创建失败");
+    } else if (wiz_listen(HOST_SOCK) != SOCK_OK) {
+        ESP_LOGE("TCP", "listen 8080 失败");
+        wiz_close(HOST_SOCK);
+    }
+    ESP_LOGI("TCP", "=== TCP 服务器已启动: 8080 (上位机); 失联保护 %d ms ===",
+             TCP_LINK_TIMEOUT_MS);
+#if NAV_ENABLE
+    ESP_LOGI("TCP", "状态回传: 主控 MPU 20Hz (type=0x01) + GPS 2Hz (type=0x04 定位 / 0x05 运动)");
+#endif
+
+    while (1) {
+        wiznet_spi_check_int();     /* INT 唤醒 (如果有) */
+        tcp_handle_host_socket();
+        tcp_check_link_timeout();
+        tcp_poll_send_local_mpu();  /* 20Hz 回传主控 MPU (type=0x01) */
+#if NAV_ENABLE
+        tcp_poll_send_gps();        /* 2Hz 回传惯导 GPS (type=0x04 + 0x05) */
+#endif
+    }
+}
+
+/** net : 查看网络 / TCP 连接状态 (联调用) */
+static int cmd_net(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    printf("TCP Server : 端口 %d (上位机); 8081 (远端) 未启用\n", TCP_HOST_PORT);
+    printf("网线链路   : %s", wiznet_manager_is_link_up() ? "已连接" : "未连接");
+    if (wiznet_manager_is_link_up()) {
+        printf("  (%d Mbps)", wiznet_manager_get_link_speed());
+    }
+    printf("\n");
+
+    esp_netif_ip_info_t info;
+    if (wiznet_manager_get_ip_info(&info) == ESP_OK) {
+        /* addr 是 uint32_t, 在本工具链上等价于 unsigned long ⇒ 必须显式转 unsigned,
+         * 否则 -Werror=format 会因为 %d 与实参类型不符直接编译失败 */
+        printf("本机 IP    : %u.%u.%u.%u\n",
+               (unsigned)(info.ip.addr & 0xFF), (unsigned)((info.ip.addr >> 8) & 0xFF),
+               (unsigned)((info.ip.addr >> 16) & 0xFF), (unsigned)((info.ip.addr >> 24) & 0xFF));
+    }
+
+    printf("上位机连接 : %s\n", s_host_connected ? "已连接" : "未连接");
+    printf("累计控制帧 : %lu\n", (unsigned long)s_ctrl_frames);
+    if (s_host_connected) {
+        if (s_last_ctrl_us == 0) {
+            printf("指令计时   : 尚未收到控制帧 (收到后才启动 %d ms 失联保护)\n",
+                   TCP_LINK_TIMEOUT_MS);
+        } else {
+            int64_t age_ms = (esp_timer_get_time() - s_last_ctrl_us) / 1000;
+            printf("指令计时   : 距上一条控制帧 %lld ms (超过 %d ms 自动停机)\n",
+                   (long long)age_ms, TCP_LINK_TIMEOUT_MS);
+        }
+    }
+    printf("提示       : 上位机 = tools\\tcp_console.py, 连本机 %d 端口, 20Hz 发 16B 控制帧\n",
+           TCP_HOST_PORT);
+    return 0;
+}
+
 /** 初始化并启动串口控制台 */
 static void console_init(void)
 {
@@ -1280,11 +2005,20 @@ static void console_init(void)
     repl_cfg.prompt = "gimbal>";
     repl_cfg.max_cmdline_length = 128;
 
+    /* console 主通道随 sdkconfig 走: 必须用与主 console 匹配的 REPL 后端。
+     * 用错后端 = 日志在一个口、REPL 在另一个口 —— 表现就是"能看日志、敲不进命令"
+     * (例如主 console 是 USB-Serial/JTAG 时却用 UART0 的 REPL, 见参数总览 §7.9)。 */
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    esp_console_dev_usb_serial_jtag_config_t usb_cfg = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&usb_cfg, &repl_cfg, &repl));
+#else
     esp_console_dev_uart_config_t uart_cfg = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_cfg, &repl_cfg, &repl));
+#endif
 
     const esp_console_cmd_t cmds[] = {
         { .command = "p",  .help = "直接输出脉宽: p <ch> <us>",              .func = cmd_pulse  },
+        { .command = "g",  .help = "按角度控制云台: g <ch> [deg] (不带 deg=查当前角度; 受软件限位约束, 要越限用 p)", .func = cmd_goto },
         { .command = "n",  .help = "在当前脉宽上微调: n <ch> <dus>",         .func = cmd_nudge  },
         { .command = "z",  .help = "回中: z [ch] (不带参数=全部通道)",        .func = cmd_center },
         { .command = "t",  .help = "设置中位微调并回中: t <ch> <trim_us>",    .func = cmd_trim   },
@@ -1301,10 +2035,23 @@ static void console_init(void)
         { .command = "att",.help = "姿态日志开关: att <0|1>",                 .func = cmd_att    },
         { .command = "t0", .help = "ch0 档位扫描测试开关: t0 <0|1>",          .func = cmd_test0  },
         { .command = "t1", .help = "ch1 角度扫描测试开关: t1 <0|1>",          .func = cmd_test1  },
-        { .command = "gps",.help = "查看 GPS 状态: gps [0|1] (带参数开关 1Hz 日志)", .func = cmd_gps },
-        { .command = "imu",.help = "读取两颗 IMU 各一帧数据",                    .func = cmd_imu },
-        { .command = "scan",.help = "扫描 I2C 总线: scan [0|1] (0=I2C0 云台, 1=I2C1 船体)", .func = cmd_scan },
-        { .command = "hull",.help = "亚博 10 轴 IMU: hull [0|1] (无参数读一帧, 带参数开关 10Hz 日志)", .func = cmd_hull },
+        { .command = "gps",.help = "惯导 GPS 快照 (亚博 GPS+IMU 一体模块): gps 查状态 / gps 0|1 开关 1Hz 日志", .func = cmd_gps },
+        { .command = "nav",.help = "惯导模块状态: 在线/输出配置(RSW/RRATE)/波特率/帧计数/两套快照", .func = cmd_nav },
+        { .command = "imu",.help = "读一帧云台 MPU6050 (原始 6 轴)",              .func = cmd_imu },
+        { .command = "scan",.help = "扫描 I2C1 (GPIO16/17): PCA9685 + 云台 MPU6050", .func = cmd_scan },
+        { .command = "hull",.help = "惯导姿态 (亚博 GPS+IMU 一体): hull [0|1] 开关 10Hz 日志 (无参读一帧)", .func = cmd_hull },
+        { .command = "m",  .help = "L298N 电机调速: m <-100~100> (正=正转, 负=反转, 0=停; |值|<60 按 60; 也可直接输裸数字)", .func = cmd_motor },
+#if REV_ESC_ENABLE
+        { .command = "l",  .help = "左路油门: l <-100~100> (正=推进 IO41, 负=反推 IO39, 0=停)", .func = cmd_esc_l },
+        { .command = "r",  .help = "右路油门: r <-100~100> (正=推进 IO42, 负=反推 IO40, 0=停)", .func = cmd_esc_r },
+#else
+        { .command = "l",  .help = "左路油门: l <0~100> (正=推进 IO41; 负值=反推, 当前已关闭⇒按停处理)", .func = cmd_esc_l },
+        { .command = "r",  .help = "右路油门: r <0~100> (正=推进 IO42; 负值同上按停处理)", .func = cmd_esc_r },
+#endif
+        { .command = "cal",.help = "电调行程标定第1步: cal <l|r|bl|br> (l/r=推进 IO41/42, bl/br=反推 IO39/40)", .func = cmd_esc_cal },
+        { .command = "cal2",.help = "电调行程标定第2步: 听到双短鸣后立刻输 (降到最低油门完成标定)", .func = cmd_esc_cal2 },
+        { .command = "pw", .help = "直接输出指定脉宽: pw <l|r|bl|br> <us> (500~2500, 人工测端点)", .func = cmd_pw },
+        { .command = "net",.help = "网络/TCP 状态: 链路/IP/上位机连接/控制帧数/失联计时", .func = cmd_net },
     };
 
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
@@ -1313,12 +2060,12 @@ static void console_init(void)
     ESP_ERROR_CHECK(esp_console_register_help_command());
 
     /* 注意: 这里刻意不调用 esp_console_start_repl().
-     * new_repl_uart 已把 UART0/VFS/linenoise 准备好 (其内部 REPL 任务会一直阻塞
-     * 在 ulTaskNotifyTake 上, 不会读串口), 我们改用自建任务, 以便支持"裸数字"输入.
+     * 上面的 new_repl_* 已把 console 通道/VFS/linenoise 准备好 (其内部 REPL 任务会一直
+     * 阻塞在 ulTaskNotifyTake 上, 不会自己去读串口), 我们改用自建任务, 以便支持"裸数字"输入.
      */
     xTaskCreate(console_repl_task, "console_repl", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "串口控制台已启动: 直接输数字改 ch0 脉宽, 或输 help 看全部指令");
+    ESP_LOGI(TAG, "串口控制台已启动 (提示符 gimbal>): 输 help 看全部指令");
 }
 
 /* ========== [临时测试] ch0 (360° 舵机) 档位扫描任务 ========== */
@@ -1331,6 +2078,12 @@ static void console_init(void)
  */
 static void servo_ch0_test_task(void *pvParameters)
 {
+    /* 舵机关停/未就绪时, 扫描测试无意义, 直接退出 (避免日志谎报"已就绪") */
+    if (!servo_is_ready()) {
+        ESP_LOGW(TAG, "[CH0 TEST] PCA9685/servo 未就绪 (SERVO_ENABLE=0 或硬件异常) => 舵机扫描测试不启动");
+        vTaskDelete(NULL);
+    }
+
     ESP_LOGI(TAG, "[CH0 TEST] 扫描测试已就绪: %d~%d us, 步进 %d us, 每档停留 %d ms (默认关闭, t0 1 开启)",
              CH0_SWEEP_MIN_US, CH0_SWEEP_MAX_US, CH0_SWEEP_STEP_US, CH0_SWEEP_DWELL_MS);
 
@@ -1406,6 +2159,12 @@ static void servo_ch0_test_task(void *pvParameters)
  */
 static void servo_ch1_test_task(void *pvParameters)
 {
+    /* 舵机关停/未就绪时, 角度扫描测试无意义, 直接退出 */
+    if (!servo_is_ready()) {
+        ESP_LOGW(TAG, "[CH1 TEST] PCA9685/servo 未就绪 (SERVO_ENABLE=0 或硬件异常) => 舵机角度扫描测试不启动");
+        vTaskDelete(NULL);
+    }
+
     ESP_LOGI(TAG, "[CH1 TEST] 扫描测试已就绪: %.0f~%.0f°, 步进 %.0f°, 每档停留 %d ms (默认关闭, t1 1 开启)",
              CH1_SWEEP_MIN_DEG, CH1_SWEEP_MAX_DEG, CH1_SWEEP_STEP_DEG, CH1_SWEEP_DWELL_MS);
 
@@ -1785,6 +2544,13 @@ static void servo_ch0_mpu_task(void *pvParameters)
  */
 static void gimbal_stab_test_task(void *pvParameters)
 {
+    /* 舵机被关停 (SERVO_ENABLE=0) 或 PCA9685 未就绪时, 闭环根本下不了发 —— 直接退出,
+     * 免得每 500ms 刷一遍无意义的 0 值, 让人误以为"稳住了"。 */
+    if (!servo_is_ready()) {
+        ESP_LOGW(TAG, "[STAB] PCA9685/servo 未就绪 (SERVO_ENABLE=0 或硬件异常) => 云台闭环自稳测试不启动");
+        vTaskDelete(NULL);
+    }
+
     ESP_LOGI(TAG, "[STAB] 云台闭环自稳测试: ch1 俯仰, 目标物理角 %.1f°", STAB_TARGET_DEG);
 
     /* 等陀螺零偏标定完成 (标定期间不能动云台) */
@@ -1794,7 +2560,18 @@ static void gimbal_stab_test_task(void *pvParameters)
     gimbal_move_to(1, 90.0f);
     vTaskDelay(pdMS_TO_TICKS(STAB_SETTLE_MS));
 
-    gimbal_enable_stabilize(1, true);
+    /* 反馈源自检: 云台 MPU6050 未就绪 (没接/标定失败) 时, 闭环会走"无反馈保护"
+     * (见 gimbal.h): 停 PID 并把 ch1 送回标定中位, 而不是拿假 0° 当反馈。 */
+    if (!imu_role_ready(IMU_ROLE_GIMBAL)) {
+        ESP_LOGW(TAG, "[STAB] 云台 MPU6050 未就绪 => 闭环将停用 PID 并回中位 %.0f°",
+                 (double)CH1_HOME_DEG);
+    }
+
+    esp_err_t stab_ret = gimbal_enable_stabilize(1, true);
+    if (stab_ret != ESP_OK) {
+        ESP_LOGE(TAG, "[STAB] 闭环开启失败: %s (PCA9685 未就绪时无法下发角度)",
+                 esp_err_to_name(stab_ret));
+    }
     vTaskDelay(pdMS_TO_TICKS(500));     /* 先锁在当前姿态, 再给目标, 避免一开就猛跳 */
     gimbal_set_target_phys(1, STAB_TARGET_DEG);
 
@@ -1805,88 +2582,60 @@ static void gimbal_stab_test_task(void *pvParameters)
         gimbal_pid_t pid;
         gimbal_get_stab_state(1, &st);
         gimbal_get_pid(1, &pid);
-        ESP_LOGI(TAG, "[STAB] 目标=%+6.1f° 实测=%+6.1f° 误差=%+6.1f° 输出标称角=%6.1f° (kp=%.2f ki=%.2f)",
-                 st.target_phys, st.meas_phys, st.err, st.cmd_deg, pid.kp, pid.ki);
+        ESP_LOGI(TAG, "[STAB] 目标=%+6.1f° 实测=%+6.1f° 误差=%+6.1f° 输出标称角=%6.1f° "
+                      "(kp=%.2f ki=%.2f)%s",
+                 st.target_phys, st.meas_phys, st.err, st.cmd_deg, pid.kp, pid.ki,
+                 st.nofb ? "  [无反馈: 已停 PID, 回中位]" : "");
     }
 }
 
 #endif /* TEST_MODE == 4 */
 
-/**
- * @brief 俯仰角闭环控制任务
- *
- * 使用 Madgwick AHRS 融合加速度 + 陀螺仪, 得到 yaw/pitch/roll,
- * 用 pitch 控制 PCA9685 通道 1 舵机.
- */
-static void pitch_control_task(void *pvParameters)
-{
-    ESP_LOGI(TAG, "[PITCH] 俯仰角控制任务启动 (ch%d, Madgwick β=%.2f)", PITCH_SERVO_CH, AHRS_BETA);
-
-    TickType_t last_wake = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(20);  /* 50Hz 控制频率 */
-
-    imu_data_t m = {0};
-    float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};  /* 初始四元数 */
-    float ypr[3] = {0};
-    uint32_t log_counter = 0;
-
-    while (1) {
-        vTaskDelayUntil(&last_wake, period);
-        float dt = 0.02f;  /* 固定步长 20ms */
-
-        if (imu_read_role(IMU_ROLE_GIMBAL, &m) != ESP_OK) {
-            ESP_LOGW(TAG, "[MPU] 读取失败");
-            continue;
-        }
-
-        /* 陀螺仪 °/s → rad/s */
-        float gx_rad = m.gx * (M_PI / 180.0f);
-        float gy_rad = m.gy * (M_PI / 180.0f);
-        float gz_rad = m.gz * (M_PI / 180.0f);
-
-        /* Madgwick AHRS 融合 */
-        madgwick_update(m.ax, m.ay, m.az, gx_rad, gy_rad, gz_rad, q, AHRS_BETA, dt);
-        quaternion_to_ypr(q, ypr);
-
-        /* pitch 弧度 → 度 */
-        float pitch_deg = ypr[1] * (180.0f / M_PI);
-
-        /* 映射俯仰角 → 舵机角度 */
-        float servo_deg;
-        if (pitch_deg <= PITCH_RANGE_MIN) {
-            servo_deg = PITCH_SERVO_MIN_DEG;
-        } else if (pitch_deg >= PITCH_RANGE_MAX) {
-            servo_deg = PITCH_SERVO_MAX_DEG;
-        } else {
-            servo_deg = PITCH_SERVO_MIN_DEG +
-                (pitch_deg - PITCH_RANGE_MIN) /
-                (PITCH_RANGE_MAX - PITCH_RANGE_MIN) *
-                (PITCH_SERVO_MAX_DEG - PITCH_SERVO_MIN_DEG);
-        }
-
-        /* 驱动舵机 */
-        if (servo_is_ready()) {
-            servo_set_angle(PITCH_SERVO_CH, servo_deg);
-        }
-
-        /* 定期打印 log */
-        log_counter++;
-        if (log_counter >= PITCH_LOG_INTERVAL) {
-            log_counter = 0;
-            float yaw_deg   = ypr[0] * (180.0f / M_PI);
-            float roll_deg  = ypr[2] * (180.0f / M_PI);
-            ESP_LOGI(TAG, "[AHRS] yaw=%.1f° pitch=%.1f° roll=%.1f°  servo=%.1f°",
-                     yaw_deg, pitch_deg, roll_deg, servo_deg);
-        }
-    }
-}
 
 /* ========== 启动流程 ========== */
 
 static void start_components(void)
 {
-    ESP_LOGI(TAG, "=== [临时测试模式] MPU6050 + PCA9685 ===");
+    /* 启动横幅: 模块清单与"已关停"备注都按上面的总开关**自动生成**,
+     * 免得改了开关却忘了改这几行字 (v6.0.1 之前是写死的, 已经和实况不符过一次)。 */
+    char off[64] = "";
+    if (!NAV_ENABLE)     strcat(off, "惯导模块/");
+    if (!SERVO_ENABLE)   strcat(off, "PCA9685/");
+    if (!MPU6050_ENABLE) strcat(off, "云台MPU/");
+    if (off[0]) off[strlen(off) - 1] = '\0';      /* 去掉末尾那个 '/' */
+    char off_note[128] = "";
+    if (off[0]) snprintf(off_note, sizeof(off_note), " (已关停: %s)", off);
+
+#if W5500_ENABLE
+    const char *net_txt = "W5500 + TCP Server 8080(上位机)";
+#else
+    const char *net_txt = "以太网已关停";
+#endif
+#if MOTOR_ENABLE
+#if REV_ESC_ENABLE
+    const char *motor_txt = " + 4路电调(推进IO41/42, 反推IO39/40) + L298N滚筒(IO38/48/47)";
+#else
+    const char *motor_txt = " + 水面电调(推进IO41/42, 反推已关闭) + L298N滚筒(IO38/48/47)";
+#endif
+#else
+    const char *motor_txt = "";
+#endif
+    ESP_LOGI(TAG, "=== [当前模式] %s%s + 串口控制台%s ===", net_txt, motor_txt, off_note);
     ESP_LOGI(TAG, "start_components 开始执行");
+
+    /* 0. 板载 WS2812 RGB LED (数据脚 GPIO26) —— 尽早钉在低电平
+     *
+     * 不给任何边沿 ⇒ WS2812 保持上电默认的"熄灭"状态 (原因见 BOARD_RGB_LED_GPIO 注释;
+     * ⚠️ 需**断电重上一次**那颗灯才会真的灭)。*/
+    gpio_config_t rgb_cfg = {
+        .pin_bit_mask = 1ULL << BOARD_RGB_LED_GPIO,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&rgb_cfg));
+    gpio_set_level(BOARD_RGB_LED_GPIO, 0);
 
     /* 1. NVS (供 IDF 内部组件使用) */
     esp_err_t ret = nvs_flash_init();
@@ -1904,50 +2653,40 @@ static void start_components(void)
         ESP_LOGI(TAG, "NVS 初始化成功");
     }
 
-    /* 2. W5500 (必须在控制 task 之前初始化) */
-    //wiznet_manager_config_t wcfg = wiznet_manager_get_default_config();
-    ///* 覆盖默认 IP 为项目约定值 192.168.29.10 (与远端节点 .11 同 /24 网段,
-    // * 远端 TCP Client connect 192.168.29.10:8081).
-    // * 默认 config 返回 192.168.1.100, 与本项目网段不符, 必须在 main.c 显式覆盖. */
-    //wcfg.ip[0]      = 192; wcfg.ip[1]      = 168; wcfg.ip[2]      = 29; wcfg.ip[3]      = 10;
-    //wcfg.gateway[0] = 192; wcfg.gateway[1] = 168; wcfg.gateway[2] = 29; wcfg.gateway[3] = 1;
-    ///* DNS 沿用默认 8.8.8.8 */
-    ///* 8 socket 缓冲 (RX+TX 各 2KB, 共 32KB) - W5500 内部 16KB/32KB/48KB 选型 */
-    ///* 注: 默认配置已设为 2KB per socket, 8 个 socket 共用 32KB W5500 SRAM */
-    //ESP_ERROR_CHECK(wiznet_manager_init(&wcfg));
+    /* 2. W5500 以太网 (初始化 + 拿 IP; TCP Server 在步骤 6 之后由任务 8 启动)
+     *    必须在控制 task 之前初始化
+     *    v5.12: 由 W5500_ENABLE 总开关控制, 室外测 GPS 时置 0 可省掉 30s 等链路 */
+#if W5500_ENABLE
+    wiznet_manager_config_t wcfg = wiznet_manager_get_default_config();
+    /* 板载 W5500 (v5.10 换板 ESP32-S3-ETH, 引脚由板卡固定),
+     * 默认配置已是本项目约定值: IP 192.168.29.10 / 网关 192.168.29.1 / DNS 8.8.8.8,
+     * 这里显式再赋一遍, 便于一眼看到本节点的网络参数 (与远端节点 .11 同 /24 网段). */
+    wcfg.ip[0]      = 192; wcfg.ip[1]      = 168; wcfg.ip[2]      = 29; wcfg.ip[3]      = 10;
+    wcfg.gateway[0] = 192; wcfg.gateway[1] = 168; wcfg.gateway[2] = 29; wcfg.gateway[3] = 1;
+    ESP_ERROR_CHECK(wiznet_manager_init(&wcfg));
+    ESP_LOGI(TAG, "W5500 初始化成功 (IP 192.168.29.10/24, 网关 192.168.29.1)");
+#else
+    ESP_LOGW(TAG, "以太网已关停 (W5500_ENABLE=0): 不初始化 W5500, 不等 link up, 不启动 TCP Server");
+#endif
 
-    /* 3. 云台姿态传感器 - I2C0: SDA=GPIO16, SCL=GPIO18
-     *    云台 MPU6050: 地址 0x68 (AD0 接 GND), 云台闭环的反馈源
-     *    注: 船体 10 轴 IMU 挂在另一条总线 I2C1 上 (见下面 4c), 两颗 IMU 互不干扰 */
-    ESP_LOGI(TAG, "初始化云台 MPU6050 (0x68)...");
-    imu_config_t icfg = imu_get_default_config();
-    esp_err_t imu_ret = imu_init_role(IMU_ROLE_GIMBAL, &icfg);
-    if (imu_ret == ESP_OK && imu_role_ready(IMU_ROLE_GIMBAL)) {
-        ESP_LOGI(TAG, "云台 MPU6050 初始化成功");
-    } else {
-        ESP_LOGE(TAG, "云台 MPU6050 初始化失败: %s", esp_err_to_name(imu_ret));
-    }
+    /* 3. 云台姿态传感器 (MPU6050) —— v5.11.2 起挪到 **4c**, 与惯导模块一起初始化。
+     *    原因: 云台 MPU6050 现在与 PCA9685 **共用 I2C1** (**v8.0 起 SDA=16/SCL=17**), 而这条总线由 servo 组件安装,
+     *    所以它必须排在 servo_init() 之后; 它原来占用的 I2C0 (16/18) 现给惯导模块的 UART2。
+     *
+     * 3b. (v6.0 已删除) 旧 GPS: NMEA-0183 / UART1 (TX=2, RX=1, PPS=3) —— 组件与命令全部删除,
+     *     GPS 数据改由惯导模块 (UART2, WIT 0x55 协议) 提供, 初始化见 4c。 */
 
-    /* 3b. GPS - UART1: ESP32 TX=GPIO2 -> GPS RX, ESP32 RX=GPIO1 <- GPS TX,
-     *     PPS 秒脉冲输入 = GPIO3 (可选, 不接也能解析 NMEA) */
-    ESP_LOGI(TAG, "初始化 GPS (UART1: TX=IO%d, RX=IO%d, PPS=IO%d)...",
-             GPS_TX_GPIO, GPS_RX_GPIO, GPS_PPS_GPIO);
-    gps_config_t gcfg = gps_get_default_config();
-    gcfg.tx_gpio  = GPS_TX_GPIO;
-    gcfg.rx_gpio  = GPS_RX_GPIO;
-    gcfg.pps_gpio = GPS_PPS_GPIO;
-    esp_err_t gps_ret = gps_init(&gcfg);
-    if (gps_ret == ESP_OK) {
-        ESP_LOGI(TAG, "GPS 初始化成功");
-    } else {
-        /* GPS 未接入属正常, 只提示不报错 */
-        ESP_LOGW(TAG, "GPS 未接入: %s", esp_err_to_name(gps_ret));
-    }
-
-    /* 4. Servo (PCA9685) - I2C1: SDA=GPIO21, SCL=GPIO17 */
+    /* 4. Servo (PCA9685) - I2C1: SDA=GPIO16, SCL=GPIO17
+     *    ⚠️ 是否调用 servo_init() 取决于"还有没有别的 I2C1 使用者":
+     *       - 云台 MPU6050 与 PCA9685 共线, 且只是**借用**总线 ⇒ MPU6050_ENABLE=1 时必须由 servo 装;
+     *       - 船体侧现在只有惯导模块, 它走 **UART2**, 不占 I2C1;
+     *       - 两者都关停 ⇒ I2C1 没有任何使用者, **完全跳过 servo_init()**, 连总线都不装。 */
+    esp_err_t servo_ret = ESP_ERR_NOT_SUPPORTED;
+#if SERVO_ENABLE || MPU6050_ENABLE
     ESP_LOGI(TAG, "初始化 PCA9685...");
     servo_config_t scfg = servo_get_default_config();
-    esp_err_t servo_ret = servo_init(&scfg);
+    scfg.pca9685_enable = (SERVO_ENABLE != 0);
+    servo_ret = servo_init(&scfg);
     if (servo_ret == ESP_OK) {
         /* 开机回中 (servo_init 已按各通道标定把全部通道置到中点):
          *   ch0 360° 位置舵机 -> 1630µs
@@ -1967,9 +2706,15 @@ static void start_components(void)
         servo_set_pulse_us(0, CH0_HOLD_US);
         ESP_LOGI(TAG, "ch0 固定脉宽测试: 定死在 %d us", CH0_HOLD_US);
 #endif
+    } else if (!SERVO_ENABLE) {
+        /* 主动关停, 不是故障: 只提示 */
+        ESP_LOGW(TAG, "PCA9685 已暂时关停 (SERVO_ENABLE=0): 仅装 I2C1 总线供云台 MPU 借用, 云台舵机/闭环不启用");
     } else {
         ESP_LOGE(TAG, "PCA9685 初始化失败: %s", esp_err_to_name(servo_ret));
     }
+#else
+    ESP_LOGW(TAG, "PCA9685 / I2C1 已关停 (SERVO_ENABLE=0 且 MPU6050_ENABLE=0): 不装 I2C1, 不调 servo_init()");
+#endif
 
     /* 4b. 云台运动规划 (依赖 servo, 必须在舵机初始化之后)
      *     把"阶跃指令"变成速度/加速度受限的轨迹, 抑制大惯量载荷的冲击与过冲. */
@@ -1981,72 +2726,127 @@ static void start_components(void)
         }
     }
 
-    /* 4c. 船体 10 轴 IMU - 亚博惯导模块, 挂在 PCA9685 那条 I2C1 上
-     *     (SDA=GPIO21, SCL=GPIO17, 地址 0x50, WIT I2C 协议)
-     *     与云台 MPU6050 (I2C0) 物理分开, 两颗 IMU 互不干扰, 都不用软件模拟 I2C。
-     *     选 I2C 而非 UART: GPS 已独占 UART1, 且模块本身支持寄存器式 I2C 读欧拉角。
-     *     ⚠️ 必须排在 servo_init() 之后: I2C1 是 servo 组件装的, imu 只是借用
-     *        (重复 i2c_driver_install 会失败); 若 PCA9685 探测失败, servo_init 会把
-     *        该总线删掉, 此时船体 IMU 也会一起读不到。 */
-    ESP_LOGI(TAG, "初始化船体 10 轴 IMU (I2C1, 0x50)...");
-    esp_err_t imu_hull_ret = imu_init_role(IMU_ROLE_HULL, &icfg);
-    if (imu_hull_ret == ESP_OK && imu_role_ready(IMU_ROLE_HULL)) {
-        ESP_LOGI(TAG, "船体 10 轴 IMU 初始化成功");
+    /* 4c. 船体侧的两类感知器件 —— 各由自己的总开关控制, 关停时完全不初始化:
+     *   ① 云台 MPU6050  : I2C1 0x68, 与 PCA9685 **共用**同一条总线 (只是借用, 所以必须排在 servo_init() 之后)
+     *                     —— 开关 MPU6050_ENABLE, 它是云台闭环的反馈源。
+     *   ② 惯导模块       : **UART2** (ESP32 RX=IO1 <- 模块 TX, ESP32 TX=IO2 -> 模块 RX),
+     *                     亚博 GPS+10 轴 IMU 一体模块, 维特(WIT) 0x55 协议**主动上报**,
+     *                     一条线同时给出姿态与 GPS —— 开关 NAV_ENABLE, 详见 components/nav/nav.h。
+     *                     (它只占 UART, 与 I2C 无关, 所以与 servo_init() 先后都行) */
+#if MPU6050_ENABLE
+    ESP_LOGI(TAG, "初始化云台 MPU6050 (I2C1 共用总线, 0x68)...");
+    imu_config_t icfg = imu_get_default_config();
+    esp_err_t imu_ret = imu_init_role(IMU_ROLE_GIMBAL, &icfg);
+    if (imu_ret == ESP_OK && imu_role_ready(IMU_ROLE_GIMBAL)) {
+        ESP_LOGI(TAG, "云台 MPU6050 初始化成功");
     } else {
-        /* 船体 IMU 还没接上属正常, 只提示不报错 —— 云台功能不受影响 */
-        ESP_LOGW(TAG, "船体 10 轴 IMU 未接入: %s", esp_err_to_name(imu_hull_ret));
+        ESP_LOGE(TAG, "云台 MPU6050 初始化失败: %s", esp_err_to_name(imu_ret));
     }
+#else
+    /* 云台没插 / 暂不测试: 不初始化 —— 顺带省掉引脚自检、
+     * "地址 0x68 无应答"、"未找到 MPU6050" 这一串报错刷屏, 姿态解算任务也不启动 */
+    ESP_LOGW(TAG, "云台 MPU6050 已暂时关停 (MPU6050_ENABLE=0): 不初始化, 姿态解算任务不启动");
+#endif
 
-    /* 5. Motor (4 路 ESC + L298N) */
-    //motor_config_t mcfg = motor_get_default_config();
-    //ESP_ERROR_CHECK(motor_init(&mcfg));
+#if NAV_ENABLE
+    ESP_LOGI(TAG, "初始化惯导模块 (UART2: ESP32 RX=IO1 <- 模块 TX, TX=IO2 -> 模块 RX)...");
+    nav_config_t ncfg = nav_get_default_config();
+    esp_err_t nav_ret = nav_init(&ncfg);
+    if (nav_ret == ESP_OK) {
+        ESP_LOGI(TAG, "惯导模块初始化成功 (GPS + 10 轴 IMU)");
+    } else {
+        /* 模块没接上属正常, 只提示不报错; 接好后驱动会自动补配置并出数据, 不必重启 */
+        ESP_LOGW(TAG, "惯导模块未接入: %s", esp_err_to_name(nav_ret));
+    }
+#else
+    ESP_LOGW(TAG, "惯导模块已关停 (NAV_ENABLE=0): 不装 UART2, GPS 与船体姿态都不可用");
+#endif
 
-    /* 6. 等待 link up (30s 超时) */
-    //ESP_LOGI(TAG, "等待网线连接...");
-    //int wait_ms = 0;
-    //while (!wiznet_manager_is_link_up() && wait_ms < 30000) {
-    //    vTaskDelay(pdMS_TO_TICKS(500));
-    //    wait_ms += 500;
-    //}
-    //if (wiznet_manager_is_link_up()) {
-    //    ESP_LOGI(TAG, "=== 网线已连接 ===");
-    //    esp_netif_ip_info_t info;
-    //    if (wiznet_manager_get_ip_info(&info) == ESP_OK) {
-    //        ESP_LOGI(TAG, "本机 IP: %d.%d.%d.%d",
-    //                 info.ip.addr & 0xFF, (info.ip.addr >> 8) & 0xFF,
-    //                 (info.ip.addr >> 16) & 0xFF, (info.ip.addr >> 24) & 0xFF);
-    //        ESP_LOGI(TAG, "子网掩码: %d.%d.%d.%d",
-    //                 info.netmask.addr & 0xFF, (info.netmask.addr >> 8) & 0xFF,
-    //                 (info.netmask.addr >> 16) & 0xFF, (info.netmask.addr >> 24) & 0xFF);
-    //        ESP_LOGI(TAG, "默认网关: %d.%d.%d.%d",
-    //                 info.gw.addr & 0xFF, (info.gw.addr >> 8) & 0xFF,
-    //                 (info.gw.addr >> 16) & 0xFF, (info.gw.addr >> 24) & 0xFF);
-    //    }
-    //} else {
-    //    ESP_LOGW(TAG, "=== 网线未连接 (30s 超时) ===");
-    //}
+    /* 5. Motor —— 4 路电调通道全部初始化: 2 路推进油门线 (ESC1=IO41 左 / ESC2=IO42 右)
+     *    + 2 路反推方向线 (REV1=IO39 左 / REV2=IO40 右), 帧率 50Hz。
+     *    好盈 SkyWalker V2 "反推刹车"接线: 方向线只给 0/100% 两个方向位, 速度走油门线;
+     *    脉宽 1100µs=停 / 1141~1940µs=油门 (见 motor.c)。
+     *    ⚠️ **反推当前暂时关闭** (`REV_ESC_ENABLE=0`): 负油门按停处理, 方向线只保持 1100µs
+     *       正向半区 (初始化它是为了让它有确定电平, 不是让它动作) —— 见 esc_apply_side() 与 §0。
+     *    L298N 通道仍照常初始化并保持停机 (ENA=IO38 / IN1=IO48 / IN2=IO47) —— 引脚被主动
+     *    驱动为"停", 比放开变悬空更安全, 但本轮不参与测试。 */
+#if MOTOR_ENABLE
+    motor_config_t mcfg = motor_get_default_config();
+    esp_err_t motor_ret = motor_init(&mcfg);
+    if (motor_ret == ESP_OK) {
+        ESP_LOGI(TAG, "电调就绪 (4 路, 已置最低油门 1100us 停): 推进 IO41/IO42, 反推 IO39/IO40");
+#if REV_ESC_ENABLE
+        ESP_LOGI(TAG, "反推已启用: 负油门 = 方向线反转半区 + 油门线给速度");
+#else
+        ESP_LOGW(TAG, "反推暂时关闭 (REV_ESC_ENABLE=0): 负油门按停处理; 方向线 IO39/IO40 保持 1100us 正向半区");
+#endif
+#if REV_ESC_ENABLE
+        ESP_LOGI(TAG, "控制台: l/r <-100~100> 或裸数字 (正=推进, 负=反推); 例: l 30 / l -30 / 0");
+#else
+        ESP_LOGI(TAG, "控制台: l/r <0~100> 或裸数字 (正=推进; 负值按停处理); 例: l 30 / r 30 / 0");
+#endif
+        ESP_LOGI(TAG, "L298N 已初始化并停机 (ENA=IO38, IN1=IO48, IN2=IO47), 本轮不测试");
+    } else {
+        ESP_LOGE(TAG, "电机初始化失败: %s", esp_err_to_name(motor_ret));
+    }
+#else
+    ESP_LOGW(TAG, "电机已关停 (MOTOR_ENABLE=0): 不初始化 L298N");
+#endif
+
+    /* 6. 等待 link up (30s 超时) 并打印本机 IP
+     *    注: 这里只确认链路与网络参数 (拿 IP); TCP Server (8080) 在步骤 8 里由
+     *        tcp_server_task 启动 —— 必须先有链路和 IP, socket 才能正常工作。
+     *    W5500_ENABLE=0 时整段跳过 (不初始化自然也没有链路可等) */
+#if W5500_ENABLE
+    ESP_LOGI(TAG, "等待网线连接...");
+    int wait_ms = 0;
+    while (!wiznet_manager_is_link_up() && wait_ms < 30000) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wait_ms += 500;
+    }
+    if (wiznet_manager_is_link_up()) {
+        ESP_LOGI(TAG, "=== 网线已连接 ===");
+        esp_netif_ip_info_t info;
+        if (wiznet_manager_get_ip_info(&info) == ESP_OK) {
+            /* 同 cmd_net: uint32_t 在本工具链上是 unsigned long, 必须转 unsigned 配 %u */
+            ESP_LOGI(TAG, "本机 IP: %u.%u.%u.%u",
+                     (unsigned)(info.ip.addr & 0xFF), (unsigned)((info.ip.addr >> 8) & 0xFF),
+                     (unsigned)((info.ip.addr >> 16) & 0xFF), (unsigned)((info.ip.addr >> 24) & 0xFF));
+            ESP_LOGI(TAG, "子网掩码: %u.%u.%u.%u",
+                     (unsigned)(info.netmask.addr & 0xFF), (unsigned)((info.netmask.addr >> 8) & 0xFF),
+                     (unsigned)((info.netmask.addr >> 16) & 0xFF), (unsigned)((info.netmask.addr >> 24) & 0xFF));
+            ESP_LOGI(TAG, "默认网关: %u.%u.%u.%u",
+                     (unsigned)(info.gw.addr & 0xFF), (unsigned)((info.gw.addr >> 8) & 0xFF),
+                     (unsigned)((info.gw.addr >> 16) & 0xFF), (unsigned)((info.gw.addr >> 24) & 0xFF));
+        }
+    } else {
+        ESP_LOGW(TAG, "=== 网线未连接 (30s 超时), 继续启动 ===");
+    }
+#endif
 
     /* 7. 日志降噪 (默认开 INFO, 但关闭驱动内不必要 tag) */
     //esp_log_level_set("wifi",       ESP_LOG_WARN);
     //esp_log_level_set("spi_master", ESP_LOG_WARN);
     //esp_log_level_set("gpio",       ESP_LOG_WARN);
 
-    /* 8. 创建任务 */
-    //xTaskCreate(tcp_server_task,    "tcp_srv", 8192, NULL, 5, NULL);
-    //xTaskCreate(mpu_push_task,      "mpu",     2048, NULL, 4, &s_mpu_push_task_handle);
-    /* status_report_task 暂时不启动 (MPU 推送已涵盖大部分状态) */
-    /* xTaskCreate(status_report_task, "status",  2048, NULL, 4, &s_status_report_task_handle); */
+    /* 8. 创建任务
+     *    TCP Server (8080 上位机) —— 收 16B 控制帧驱动电调/滚筒, 带 500ms 失联保护。
+     *    栈 8192: control 解析 + wiz_* 调用 + printf 缓冲较费栈。
+     *    mpu_push_task / status_report_task 仍不启动 (无 MPU 数据源, 暂不回传状态)。 */
+#if W5500_ENABLE
+    xTaskCreate(tcp_server_task, "tcp_srv", 8192, NULL, 5, NULL);
+#endif
 
-    /* [临时测试] 启动 MPU 三维姿态解算任务 */
+#if MPU6050_ENABLE
+    /* [临时测试] 启动 MPU 三维姿态解算任务 (依赖云台 MPU6050) */
     xTaskCreate(attitude_task, "attitude", 4096, NULL, 5, NULL);
+#endif
 
-    /* [临时测试] 启动 GPS 1Hz 日志任务 (默认静默, 用 gps 1 打开) */
-    if (gps_ret == ESP_OK) {
-        xTaskCreate(gps_log_task, "gps_log", 4096, NULL, 4, NULL);
-    }
-
-    /* [临时测试] 启动船体(亚博) 10 轴 IMU 日志任务 (默认 10Hz 输出, 用 hull 0 关) */
-    xTaskCreate(hull_log_task, "hull_log", 4096, NULL, 4, NULL);
+    /* [临时测试] 惯导日志任务: GPS 1Hz (默认静默, 用 gps 1 开) + 姿态 10Hz (用 hull 1 开) */
+#if NAV_ENABLE
+    xTaskCreate(nav_gps_log_task, "nav_gps", 4096, NULL, 4, NULL);
+    xTaskCreate(nav_att_log_task, "nav_att", 4096, NULL, 4, NULL);
+#endif
 
     /* [临时测试] 启动 ch0 舵机档位扫描任务 */
     xTaskCreate(servo_ch0_test_task, "ch0_test", 3072, NULL, 4, NULL);
@@ -2071,7 +2871,11 @@ static void start_components(void)
     /* [临时测试] 启动串口标定控制台 (最后启动, 之前日志不干扰提示符) */
     console_init();
 
-    ESP_LOGI(TAG, "=== [临时测试模式] 启动完成: MPU6050 + PCA9685 ===");
+#if W5500_ENABLE
+    ESP_LOGI(TAG, "=== [当前模式] 启动完成: W5500 + TCP Server 8080(上位机, 失联保护 500ms) + 水面电调(推进 IO41/42 + 反推方向线 IO39/40) + L298N滚筒 + 串口控制台 ===");
+#else
+    ESP_LOGI(TAG, "=== [当前模式] 启动完成: 以太网已关停 + 水面电调(推进 IO41/42 + 反推方向线 IO39/40) + L298N滚筒 + 串口控制台 ===");
+#endif
 }
 
 void app_main(void)

@@ -7,11 +7,14 @@
  * 转发函数, 供应用层使用.
  */
 
-#include "wiznet_socket.h"
-
 /* ioLibrary 的 socket.h 在本文件中必须放在所有可能引入 lwip/sockets.h
- * 的头文件之前, 否则 lwip 的 static inline 会污染本翻译单元. */
+ * 的头文件之前, 否则 lwip 的 static inline 会污染本翻译单元。
+ * ⚠️ 并且必须排在 wiznet_socket.h **之前**: 后者在包含 socket.h 时会临时把
+ *    `close` 改名 (避免与 newlib 的 int close(int) 冲突) —— 本文件要用 ioLibrary
+ *    原生的 close()/socket()/listen() 等, 所以先正常包含 socket.h 拿到真实声明,
+ *    之后 wiznet_socket.h 里那次 include 会被头文件保护跳过, 不再改名。 */
 #include "socket.h"
+#include "wiznet_socket.h"
 
 int8_t wiz_socket(uint8_t sn, uint8_t protocol, uint16_t port, uint8_t flag)
 {

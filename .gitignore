@@ -78,6 +78,11 @@ Desktop.ini
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
 
-# 第三方参考源码（仅本地参考，不入库）
+# 第三方参考资料（仅本地参考，不入库）
 # 亚博 10 轴 IMU 的 I2C 示例工程（WIT 寄存器协议来源，见参数总览 §7.5）
 IMU-IIC示例/
+# 惯导模块（维特 WIT 协议）厂商资料：模块通讯协议 PDF + STM32 串口例程（见参数总览 §7.10）
+10轴IMU模块通讯协议.pdf
+STM32-串口应用例程(IMU)/
+# 旧 GPS（ATGM336H / NMEA-0183）厂商资料：手册、协议规范、单片机例程与接线图
+GPS资料/

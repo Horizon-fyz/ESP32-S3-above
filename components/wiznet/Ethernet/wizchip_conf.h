@@ -128,7 +128,12 @@ extern "C" {
     @todo You should select one of @ref _PHY_IO_MODE_PHYCR_ or @ref _PHY_IO_MODE_MII_.
     @sa ctlwizchip()
 */
+/* ⚠️ 本项目改动: 原版这里是**无保护**的强制定义 (会把外部设的值覆盖掉并触发
+ *    "macro redefined" 警告); 改为 #ifndef 保护 —— 由 wiznet_conf.h 统一决定取值,
+ *    本行只作"未定义时的默认值"。默认值与工程实况一致 (_PHY_IO_MODE_MII_)。 */
+#ifndef _PHY_IO_MODE_
 #define _PHY_IO_MODE_                  _PHY_IO_MODE_MII_ //_PHY_IO_MODE_MII_
+#endif
 
 
 

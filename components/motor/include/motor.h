@@ -24,11 +24,11 @@ extern "C" {
  * @brief 电机 ID 枚举
  */
 typedef enum {
-    MOTOR_ESC_1 = 0,    ///< 推进电调 1 (PWM: GPIO42)
-    MOTOR_ESC_2,        ///< 推进电调 2 (PWM: GPIO41)
+    MOTOR_ESC_1 = 0,    ///< 推进电调 1 = 左推进 (PWM: GPIO41)
+    MOTOR_ESC_2,        ///< 推进电调 2 = 右推进 (PWM: GPIO42)
     MOTOR_MAIN_DC,      ///< 主推进直流电机 (L298N: ENA=38 + IN1=48 + IN2=47)
-    MOTOR_THRUST_REV_1, ///< 反推电调 1 (PWM: GPIO40, 与 ESC1/2 同组连续脚)
-    MOTOR_THRUST_REV_2, ///< 反推电调 2 (PWM: GPIO39, 与 ESC1/2 同组连续脚)
+    MOTOR_THRUST_REV_1, ///< 反推电调 1 = 左反推 (PWM: GPIO39, 与 ESC1/2 同组连续脚)
+    MOTOR_THRUST_REV_2, ///< 反推电调 2 = 右反推 (PWM: GPIO40, 与 ESC1/2 同组连续脚)
     MOTOR_MAX,
 } motor_id_t;
 
@@ -45,13 +45,13 @@ typedef enum {
  * @brief 电机配置
  */
 typedef struct {
-    /* 电调 1 (MOTOR_ESC_1) - GPIO42 */
+    /* 电调 1 (MOTOR_ESC_1) - GPIO41 左推进 */
     int      esc1_gpio;         ///< 电调 1 PWM 引脚 (-1=未使用)
     uint32_t esc1_freq_hz;      ///< 电调 1 频率 (典型 50Hz)
     uint8_t  esc1_ledc_timer;
     uint8_t  esc1_ledc_channel;
 
-    /* 电调 2 (MOTOR_ESC_2) - GPIO41 */
+    /* 电调 2 (MOTOR_ESC_2) - GPIO42 右推进 */
     int      esc2_gpio;         ///< 电调 2 PWM 引脚 (-1=未使用)
     uint32_t esc2_freq_hz;      ///< 电调 2 频率 (典型 50Hz)
     uint8_t  esc2_ledc_timer;
@@ -65,13 +65,13 @@ typedef struct {
     uint8_t  dc_ledc_timer;
     uint8_t  dc_ledc_channel;
 
-    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO40 */
+    /* 反推电调 1 (MOTOR_THRUST_REV_1) - GPIO39 左反推 */
     int      rev1_gpio;         ///< 反推电调 1 PWM 引脚 (-1=未使用)
     uint32_t rev1_freq_hz;      ///< 反推电调 1 频率 (典型 50Hz)
     uint8_t  rev1_ledc_timer;
     uint8_t  rev1_ledc_channel;
 
-    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO39 */
+    /* 反推电调 2 (MOTOR_THRUST_REV_2) - GPIO40 右反推 */
     int      rev2_gpio;         ///< 反推电调 2 PWM 引脚 (-1=未使用)
     uint32_t rev2_freq_hz;      ///< 反推电调 2 频率 (典型 50Hz)
     uint8_t  rev2_ledc_timer;
@@ -92,9 +92,21 @@ esp_err_t motor_init(const motor_config_t *cfg);
  * @brief 设置电调油门
  *
  * @param id       电机 ID (MOTOR_ESC_1 / MOTOR_ESC_2 / MOTOR_THRUST_REV_1 / MOTOR_THRUST_REV_2)
- * @param throttle 油门百分比, -100.0 (反向最大) ~ +100.0 (正向最大), 0=停
+ * @param throttle 油门百分比 0 (最低/停) ~ 100 (最高)。
+ *                 **SkyWalker V2 为单向电调, 不接受负油门** (负值按 0 处理;
+ *                 该电调的反推由独立黄线"反推刹车"通道实现, 不靠油门反向)。
  */
 esp_err_t motor_set_esc_throttle(motor_id_t id, float throttle);
+
+/**
+ * @brief 直接输出指定脉宽 (调试/标定用, 绕过油门百分比映射)
+ *
+ * 用于人工测定电调的真实端点: 从小到大逐步加大脉宽, 观察电机从哪一点开始转。
+ * @param id       电调 ID (MOTOR_ESC_1 / MOTOR_ESC_2 / MOTOR_THRUST_REV_1 / MOTOR_THRUST_REV_2)
+ * @param pulse_us 高电平脉宽 (µs), 允许 500 ~ min(2500, 帧周期); 超出返回 ESP_ERR_INVALID_ARG。
+ *                 ⚠️ 上限受**帧周期**限制: 脉宽不可能超过一个周期 (周期 = 1/MOTOR_ESC_FREQ_HZ)。
+ */
+esp_err_t motor_set_esc_pulse_us(motor_id_t id, uint32_t pulse_us);
 
 /**
  * @brief 设置 L298N 直流电机速度与方向

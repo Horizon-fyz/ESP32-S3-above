@@ -104,10 +104,17 @@ esp_err_t gimbal_get_state(uint8_t ch, gimbal_state_t *st);
  *   fb_sign 是**反馈方向**: 目标物理角增大时, 标称角该往哪边走。
  *     ch1 = −1 (实测 pitch 与标称角反向)   ch0 = +1 (实测 yaw 与标称角同向)
  *
+ * 无反馈保护 (重要):
+ *   闭环依赖 gimbal_feed_attitude() 持续喂入实测角。若云台 MPU 未就绪、陀螺零偏
+ *   标定失败或读数中断, 实测角会恒为 0 —— 那不是"真实水平"。照跑 PID 的话误差恒 0,
+ *   输出会停在 0° 并被行程限位钳到下限 (ch1 = 30°), 把俯仰顶死。
+ *   因此超过 GIMBAL_FB_TIMEOUT_MS 没收到喂入时: **停 PID, 该轴送回标定中位**
+ *   (中位脉宽 = (min_us+max_us)/2 + trim), 状态里 `nofb = true`; 反馈恢复后自动接管。
+ *
  * 关于外部参考源 (预留):
  *   现在只用云台 MPU 独立闭环即可 —— 重力是绝对参考, 自稳不需要船体信息。
- *   将来接入船体 IMU / GPS 时, 只需把它们的值喂进来参与运算 (例如船体姿态
- *   做前馈、GPS 航向替代 yaw 做绝对参考), 不用改这里的结构。
+ *   将来要接**惯导模块** (components/nav: 船体姿态 + GPS) 时, 只需把它的值喂进来
+ *   参与运算 (例如船体姿态做前馈、GPS 航向替代 yaw 做绝对参考), 不用改这里的结构。
  */
 
 /** 单通道闭环 PID 参数 */
@@ -120,6 +127,7 @@ typedef struct {
 /** 单通道闭环状态 (只读) */
 typedef struct {
     bool  enabled;      ///< 是否开启闭环
+    bool  nofb;         ///< 无姿态反馈 (云台 MPU 未就绪/标定失败/读数中断): 已停 PID 并回中位
     float target_phys;  ///< 目标物理角 (°)
     float meas_phys;    ///< 最近一次喂入的实测物理角 (°)
     float err;          ///< 最近一次误差 (°, = target − meas)

@@ -11,8 +11,14 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# 日志走 UART0 (GPIO43/44), 115200
-CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# 控制台走板载原生 USB (USB-Serial/JTAG), 115200
+#   板子上有两个 USB-C: ①原生 USB (VID_303A, ESP32-S3 内部 USB-Serial/JTAG) ②USB-UART 桥 (CH340)。
+#   原先主 console = UART0(GPIO43/44): 只有插 CH340 口才能**输入**; 插原生 USB 口只能看日志
+#   (次要 console 按 IDF 设计只输出、不收输入 —— 敲字会写超时)。
+#   现把主 console 设到原生 USB: 插原生 USB 口即可"日志 + 交互(gimbal>)"，烧录也走同一个口。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# 次要 console 关闭 —— 之后 UART0(GPIO43/44) 不再输出日志
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # Enable DHCP ARP check to detect IP address conflicts on the network
 CONFIG_LWIP_DHCP_DOES_ARP_CHECK=y

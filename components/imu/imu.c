@@ -1,6 +1,14 @@
 /**
  * @file imu.c
- * @brief MPU6050 驱动实现 (I2C 主机)
+ * @brief 云台 MPU6050 驱动实现 (I2C1 借用 servo 装的总线, 地址 0x68)
+ *
+ * 只驱动云台 MPU6050: SDA=GPIO16, SCL=GPIO17, 与 PCA9685 (0x40) 共用 I2C1。
+ * 该总线由 servo 组件安装, 本组件只借用、不重复安装, 所以必须 **先 servo_init()**,
+ * 再调 imu_init_role(IMU_ROLE_GIMBAL, ...)。
+ * 只出原始 6 轴 (加速度 / 角速度) + 温度, 姿态由上层 Madgwick 解算。
+ *
+ * 船体惯导数据已由 `components/nav` (GPS+IMU 一体惯导模块, WIT 协议) 接管,
+ * 本组件不再包含任何船体 IMU / UART 相关代码。
  *
  * 寄存器定义参考 GY-521 模块资料 PS-MPU-6000A.pdf / RM-MPU-6000A.pdf
  * 初始化流程参考 51-串口-mpu6050.c 参考程序
@@ -19,7 +27,6 @@
  */
 
 #include "imu.h"
-#include <math.h>
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -97,37 +104,6 @@ static const char *TAG = "imu";
 /* WHO_AM_I 应该返回 0x68 (MPU-6050) */
 #define MPU6050_WHO_AM_I_VAL   0x68
 
-/* ===== 船体 10 轴 IMU (亚博 10轴IMU惯导模块, WIT 协议) =====
- *
- * 寄存器表来自官方《10轴IMU模块通讯协议》:
- *   0x1A IICADDR  设备地址 (默认 0x0050 -> 0x50), 可写 0x01~0x7F
- *   0x2E VERSION  固件版本号 (只读)
- *   0x34~0x36  AX/AY/AZ   加速度
- *   0x37~0x39  GX/GY/GZ   角速度
- *   0x3A~0x3C  HX/HY/HZ   磁场
- *   0x3D~0x3F  Roll/Pitch/Yaw  内部解算姿态角
- *   0x40       TEMP       温度
- *
- * 读写时序 (与 MPU6050 不同, 数据是"低字节在前"):
- *   写: START, 地址+W, 寄存器, 数据低8位, 数据高8位, ..., STOP
- *   读: START, 地址+W, 寄存器, RESTART, 地址+R, 数据低8位(ACK), 数据高8位(NACK), STOP
- */
-#define WIT_I2C_ADDR_DEFAULT   0x50
-#define WIT_REG_IICADDR        0x1A   /* 回读自己配置的 I2C 地址(低字节), 用来识别型号 */
-#define WIT_REG_VERSION        0x2E
-#define WIT_REG_ACC_X          0x34   /* 连续 6 个寄存器: AX AY AZ GX GY GZ */
-#define WIT_REG_ROLL           0x3D   /* 连续 4 个寄存器: Roll Pitch Yaw TEMP */
-
-/* 换算系数 (官方协议给的公式, 对应出厂默认量程 ±16g / ±2000°/s):
- *   加速度 = raw / 32768 * 16   (g)
- *   角速度 = raw / 32768 * 2000 (°/s)
- *   角度   = raw / 32768 * 180  (°)
- *   温度   = raw / 100          (°C)
- */
-#define WIT_ACCEL_LSB          (32768.0f / 16.0f)
-#define WIT_GYRO_LSB           (32768.0f / 2000.0f)
-#define WIT_ANGLE_LSB          (32768.0f / 180.0f)
-
 /* PWR_MGMT_1 位 */
 #define PWR_MGMT_1_DEVICE_RESET  0x80
 #define PWR_MGMT_1_SLEEP         0x40
@@ -170,17 +146,13 @@ static const char *TAG = "imu";
 
 /* ===== I2C 总线 =====
  *
- * 两颗器件各占一条独立总线 (ESP32-S3 只有 2 个 I2C 控制器, 正好用完):
- *   云台 MPU6050   : I2C0, SDA=GPIO16, SCL=GPIO18 —— 由本组件安装
- *   船体 10 轴 IMU : I2C1, SDA=GPIO21, SCL=GPIO17 —— 与 PCA9685 共用,
- *                    该总线由 servo 组件安装, 本组件只借用、不重复安装。
+ * 云台 MPU6050: I2C1, SDA=GPIO16, SCL=GPIO17 —— 与 PCA9685 (0x40) 共用同一条总线,
+ * 该总线由 servo 组件安装, 本组件只借用、不重复安装。
  *
  * 为什么不能重复安装: IDF 的 i2c_driver_install() 对已安装端口直接返回 ESP_FAIL,
  * 而 i2c_param_config() 不做"是否已安装"检查, 会重新配置引脚并把 PCA9685 的总线搞坏。
- * 因此 main.c 必须保证 servo_init() 先于 imu_init_role(IMU_ROLE_HULL, ...) 执行。
+ * 因此 main.c 必须保证 servo_init() 先于 imu_init_role(IMU_ROLE_GIMBAL, ...) 执行。
  */
-#define IMU_GIMBAL_I2C_PORT  I2C_NUM_0
-#define IMU_HULL_I2C_PORT    I2C_NUM_1
 #define I2C_MASTER_TIMEOUT   pdMS_TO_TICKS(1000)
 #define I2C_MASTER_FREQ_HZ_DEFAULT  400000
 
@@ -190,14 +162,16 @@ static const char *TAG = "imu";
 #define MPU_PROBE_RETRY_MS   30
 
 /* ===== 模块状态 ===== */
-/* 每个角色挂在哪条总线上 */
+/* 每个角色挂在哪条 I2C 总线上 (云台与 PCA9685 共用 I2C1) */
 static const i2c_port_t s_port[IMU_ROLE_COUNT] = {
-    [IMU_ROLE_GIMBAL] = IMU_GIMBAL_I2C_PORT,
-    [IMU_ROLE_HULL]   = IMU_HULL_I2C_PORT,
+    [IMU_ROLE_GIMBAL] = I2C_NUM_1,
 };
 
-/* 每个角色的总线是否已就绪 (云台那条由本组件装, 船体那条由 servo 装) */
+/* 每个角色的总线是否已就绪 (可能由本组件装, 也可能由 servo 装好后借用) */
 static bool s_bus_ready[IMU_ROLE_COUNT];
+
+/* 该角色的总线**是否由本组件安装** (只有自己装的才允许在 deinit 时删) */
+static bool s_bus_owned[IMU_ROLE_COUNT];
 
 /* 每颗设备的状态, 按 imu_role_t 索引 */
 static struct {
@@ -207,15 +181,10 @@ static struct {
     imu_gyro_range_t  gyro_range;
 } s_dev[IMU_ROLE_COUNT];
 
-/* 各角色的出厂默认地址 (云台 MPU6050: AD0=GND -> 0x68; 船体 10 轴 IMU: WIT 默认 0x50) */
-static uint8_t role_default_addr(imu_role_t role)
-{
-    return (role == IMU_ROLE_HULL) ? WIT_I2C_ADDR_DEFAULT : MPU6050_I2C_ADDR_LOW;
-}
-
 static const char *role_name(imu_role_t role)
 {
-    return (role == IMU_ROLE_HULL) ? "船体" : "云台";
+    (void)role;
+    return "云台";
 }
 
 /* ===== 量程 -> LSB 单位换算 ===== */
@@ -263,7 +232,7 @@ static uint8_t accel_fs_sel(imu_accel_range_t r)
     }
 }
 
-/* ===== 低层 I2C 操作 (要带端口和目标地址: 两颗器件分属两条总线) ===== */
+/* ===== 低层 I2C 操作 (要带端口和目标地址) ===== */
 static esp_err_t i2c_write_reg(i2c_port_t port, uint8_t addr, uint8_t reg, uint8_t val)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -345,83 +314,17 @@ static esp_err_t mpu_probe(i2c_port_t port, uint8_t addr)
     return ESP_OK;
 }
 
-/* ===== 船体 10 轴 IMU (WIT 协议) ===== */
-
-/**
- * 取一个 16 位有符号量.
- * WIT 寄存器里多字节数据是"低字节在前, 高字节在后" (与 MPU6050 相反).
- */
-static inline int16_t wit_s16(const uint8_t *p)
-{
-    return (int16_t)(((int16_t)p[1] << 8) | p[0]);
-}
-
-/**
- * 探测器件是否在线.
- * WIT 没有 WHO_AM_I, 这里读 VERSION(0x2E) 判断: 能读回来就说明器件在.
- * 带重试, 兼容上电初期偶发 NACK.
- */
-static esp_err_t wit_probe(i2c_port_t port, uint8_t addr)
-{
-    uint8_t   ver[2] = {0};
-    esp_err_t ret    = ESP_FAIL;
-
-    for (int i = 0; i < MPU_PROBE_RETRY; i++) {
-        ret = i2c_read_regs(port, addr, WIT_REG_VERSION, ver, sizeof(ver));
-        if (ret == ESP_OK) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(MPU_PROBE_RETRY_MS));
-    }
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ESP_LOGI(TAG, "VERSION=0x%04X @ addr 0x%02X", (unsigned)((ver[1] << 8) | ver[0]), addr);
-    return ESP_OK;
-}
-
-/**
- * 读一帧: 原始 6 轴 + 模块内部解算的 Roll/Pitch/Yaw + 温度.
- * 只读不写 —— WIT 写配置寄存器要先解锁且有 10s 超时限制, 这里不需要碰.
- */
-static esp_err_t wit_read(i2c_port_t port, uint8_t addr, imu_data_t *out)
-{
-    uint8_t raw[12] = {0};   /* 0x34~0x39, 6 个 16 位寄存器: AX AY AZ GX GY GZ */
-    uint8_t ang[8]  = {0};   /* 0x3D~0x40, 4 个 16 位寄存器: Roll Pitch Yaw TEMP */
-
-    esp_err_t ret = i2c_read_regs(port, addr, WIT_REG_ACC_X, raw, sizeof(raw));
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    ret = i2c_read_regs(port, addr, WIT_REG_ROLL, ang, sizeof(ang));
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    out->ax = (float)wit_s16(&raw[0]) / WIT_ACCEL_LSB;
-    out->ay = (float)wit_s16(&raw[2]) / WIT_ACCEL_LSB;
-    out->az = (float)wit_s16(&raw[4]) / WIT_ACCEL_LSB;
-    out->gx = (float)wit_s16(&raw[6]) / WIT_GYRO_LSB;
-    out->gy = (float)wit_s16(&raw[8]) / WIT_GYRO_LSB;
-    out->gz = (float)wit_s16(&raw[10]) / WIT_GYRO_LSB;
-
-    out->roll  = (float)wit_s16(&ang[0]) / WIT_ANGLE_LSB;
-    out->pitch = (float)wit_s16(&ang[2]) / WIT_ANGLE_LSB;
-    out->yaw   = (float)wit_s16(&ang[4]) / WIT_ANGLE_LSB;
-
-    out->temperature  = (float)wit_s16(&ang[6]) / 100.0f;
-    out->timestamp_us = (uint64_t)esp_timer_get_time();
-    return ESP_OK;
-}
-
 /* ===== 默认配置 ===== */
 imu_config_t imu_get_default_config(void)
 {
     imu_config_t cfg = {
+        /* ⚠️ 引脚/频率只在"本组件自己安装该角色的总线"时生效。
+         * 云台 MPU6050 与 PCA9685 共用 I2C1, 该总线由 servo 组件安装 (16/17),
+         * 因此这里的 sda/scl 当前不生效, 仅作记录。 */
         .sda_gpio    = 16,
-        .scl_gpio    = 18,
+        .scl_gpio    = 17,
         .i2c_freq_hz = I2C_MASTER_FREQ_HZ_DEFAULT,
-        .i2c_addr    = 0,   /* 0 = 自动探测 */
+        .i2c_addr    = 0,   /* 0 = 自动探测 (MPU6050 默认地址 0x68) */
         /* 与 main.c 中协议推算一致:
          *   ax/ay/az  × 16384  (即 ±2g LSB)
          *   gx/gy/gz  × 131    (即 ±250°/s LSB, 防止 int16 溢出)
@@ -457,15 +360,12 @@ static bool i2c_addr_alive(i2c_port_t port, uint8_t addr)
  *
  * @param port      总线号
  * @param mpu_addr  输出: WHO_AM_I==0x68 的地址 (没有则 0); 可为 NULL
- * @param wit_addr  输出: IICADDR(0x1A) 低字节 == 自身地址 的地址, 即 10 轴 IMU
- *                        (没有则 0); 可为 NULL
  */
-static void i2c_bus_scan(i2c_port_t port, uint8_t *mpu_addr, uint8_t *wit_addr)
+static void i2c_bus_scan(i2c_port_t port, uint8_t *mpu_addr)
 {
     ESP_LOGW(TAG, "扫描 I2C%d 总线 (0x08~0x77)...", (int)port);
 
     if (mpu_addr) *mpu_addr = 0;
-    if (wit_addr) *wit_addr = 0;
 
     int found = 0;
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
@@ -474,51 +374,16 @@ static void i2c_bus_scan(i2c_port_t port, uint8_t *mpu_addr, uint8_t *wit_addr)
         }
         found++;
 
-        /* 逐个试读几个特征寄存器, 帮助识别型号 */
-        uint8_t who = 0, id[2] = {0}, ver[2] = {0}, roll[2] = {0};
-        bool r_who  = (i2c_read_reg (port, addr, REG_WHO_AM_I,    &who) == ESP_OK);
-        bool r_1a   = (i2c_read_regs(port, addr, WIT_REG_IICADDR, id,   2) == ESP_OK);
-        bool r_2e   = (i2c_read_regs(port, addr, WIT_REG_VERSION, ver,  2) == ESP_OK);
-        bool r_3d   = (i2c_read_regs(port, addr, WIT_REG_ROLL,    roll, 2) == ESP_OK);
+        /* 读 WHO_AM_I 帮助识别型号 (PCA9685 等没有该寄存器, 读不到) */
+        uint8_t who  = 0;
+        bool    r_who = (i2c_read_reg(port, addr, REG_WHO_AM_I, &who) == ESP_OK);
 
-        ESP_LOGW(TAG, "  0x%02X 有应答 | 0x75:%s 0x1A:%s 0x2E:%s 0x3D:%s", addr,
-                 r_who ? "OK" : "--", r_1a ? "OK" : "--",
-                 r_2e  ? "OK" : "--", r_3d ? "OK" : "--");
+        ESP_LOGW(TAG, "  0x%02X 有应答 | 0x75:%s", addr, r_who ? "OK" : "--");
         if (r_who) ESP_LOGW(TAG, "      WHO_AM_I = 0x%02X", who);
-        if (r_1a)  ESP_LOGW(TAG, "      IICADDR  = 0x%02X", id[0]);
-        if (r_2e)  ESP_LOGW(TAG, "      VERSION  = 0x%04X", (unsigned)((ver[1] << 8) | ver[0]));
-        if (r_3d)  ESP_LOGW(TAG, "      Roll_raw = %d", (int)wit_s16(roll));
 
-        bool is_mpu = r_who && (who == MPU6050_WHO_AM_I_VAL);
-
-        /* 识别 10 轴 IMU (没有 WHO_AM_I, 只能靠物理约束):
-         *   VERSION(0x2E) 非 0 排除"读什么都返回 0"的器件 (PCA9685 就是), 再加任一条:
-         *     a) 加速度模长落在 0.4~1.6 g —— 静止时必然是 1g, 随机数据几乎不可能满足
-         *     b) IICADDR(0x1A) 回读值 == 自身地址 —— 模块自洽特征
-         */
-        bool is_wit = false;
-        if (!is_mpu && r_2e && (((unsigned)ver[1] << 8) | ver[0]) != 0) {
-            uint8_t acc[12] = {0};
-            if (i2c_read_regs(port, addr, WIT_REG_ACC_X, acc, sizeof(acc)) == ESP_OK) {
-                float ax = (float)wit_s16(&acc[0]) / WIT_ACCEL_LSB;
-                float ay = (float)wit_s16(&acc[2]) / WIT_ACCEL_LSB;
-                float az = (float)wit_s16(&acc[4]) / WIT_ACCEL_LSB;
-                float g  = sqrtf(ax * ax + ay * ay + az * az);
-                ESP_LOGW(TAG, "      加速度 = (%+.2f %+.2f %+.2f) g, |a| = %.2f g",
-                         ax, ay, az, g);
-                is_wit = (g > 0.4f && g < 1.6f);
-            }
-            if (!is_wit && r_1a && id[0] == addr) {
-                is_wit = true;
-            }
-        }
-
-        if (is_mpu) {
+        if (r_who && who == MPU6050_WHO_AM_I_VAL) {
             ESP_LOGW(TAG, "      ^^ 判定为 MPU6050");
             if (mpu_addr && *mpu_addr == 0) *mpu_addr = addr;
-        } else if (is_wit) {
-            ESP_LOGW(TAG, "      ^^ 判定为 10 轴 IMU");
-            if (wit_addr && *wit_addr == 0) *wit_addr = addr;
         }
     }
 
@@ -526,6 +391,9 @@ static void i2c_bus_scan(i2c_port_t port, uint8_t *mpu_addr, uint8_t *wit_addr)
         ESP_LOGE(TAG, "总线上没有任何设备应答 => 检查 SDA/SCL 是否接反、VCC/GND 是否接好");
     } else {
         ESP_LOGW(TAG, "扫描结束, 共 %d 个设备应答", found);
+        if (mpu_addr == NULL || *mpu_addr == 0) {
+            ESP_LOGW(TAG, "未能自动识别出 MPU6050 (没有 WHO_AM_I == 0x68 的设备)");
+        }
     }
 }
 
@@ -540,7 +408,7 @@ static void i2c_bus_scan(i2c_port_t port, uint8_t *mpu_addr, uint8_t *wit_addr)
  * 2) 把引脚当普通输出驱动 0/1 再回读, 验证引脚本身的输出驱动与输入通路,
  *    用来区分"外部线路问题"和"这颗 GPIO 已经损坏"。
  *
- * 只对本组件自己安装的总线 (I2C0) 做 —— 做完紧接着 param_config 把引脚交还给 I2C 外设。
+ * 只对本组件自己安装的总线做 —— 做完紧接着 param_config 把引脚交还给 I2C 外设。
  */
 static void i2c_pins_selftest(const char *name, int sda_gpio, int scl_gpio)
 {
@@ -606,14 +474,13 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
     const i2c_port_t port = s_port[role];
     esp_err_t ret;
 
-    /* 1. 准备总线
-     *    云台 (I2C0): 由本组件安装
-     *    船体 (I2C1): 该总线已由 servo 组件为 PCA9685 安装, 只借用不安装 ——
-     *                 重复 install 会返回 ESP_FAIL, param_config 还会重配引脚 */
+    /* 1. 准备总线 —— 云台 MPU6050 与 PCA9685 共用 I2C1, 该总线由 servo 组件安装,
+     *    本组件只**借用**、不重复安装: 重复 install 会返回 ESP_FAIL,
+     *    param_config 还会重配引脚把总线搞坏。 */
     if (!s_bus_ready[role]) {
-        if (role == IMU_ROLE_HULL) {
-            ESP_LOGI(TAG, "复用 I2C%d (PCA9685 的总线, 由 servo 组件安装, 不重复初始化)",
-                     (int)port);
+        bool borrow = (role == IMU_ROLE_GIMBAL);
+        if (borrow) {
+            ESP_LOGI(TAG, "复用 I2C%d (由 servo 组件安装, 不重复初始化)", (int)port);
         } else {
             /* 装 I2C 外设之前, 先用普通 GPIO 做一次引脚物理层自检 */
             i2c_pins_selftest(role_name(role), cfg->sda_gpio, cfg->scl_gpio);
@@ -636,6 +503,7 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
                 ESP_LOGE(TAG, "i2c_driver_install 失败: %s", esp_err_to_name(ret));
                 return ret;
             }
+            s_bus_owned[role] = true;          /* 自己装的, deinit 时才允许删 */
             ESP_LOGI(TAG, "I2C%d 初始化: SDA=IO%d, SCL=IO%d, %luHz",
                      (int)port, cfg->sda_gpio, cfg->scl_gpio,
                      (unsigned long)cfg->i2c_freq_hz);
@@ -645,48 +513,19 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
 
     uint8_t addr;
 
-    /* 2. 确定地址: cfg 指定优先, 否则按角色取出厂默认地址 */
+    /* 2. 确定地址: cfg 指定优先, 否则用出厂默认地址 0x68 (AD0 接 GND) */
     if (cfg->i2c_addr != 0) {
-        if (cfg->i2c_addr != MPU6050_I2C_ADDR_LOW &&
-            cfg->i2c_addr != MPU6050_I2C_ADDR_HIGH &&
-            cfg->i2c_addr != WIT_I2C_ADDR_DEFAULT) {
-            ESP_LOGE(TAG, "非法地址 0x%02X", cfg->i2c_addr);
+        /* 放开为任意 7 位 I2C 地址 (0x08~0x77), 便于现场"指定地址试一下" */
+        if (cfg->i2c_addr < 0x08 || cfg->i2c_addr > 0x77) {
+            ESP_LOGE(TAG, "非法地址 0x%02X (应为 0x08~0x77)", cfg->i2c_addr);
             return ESP_ERR_INVALID_ARG;
         }
         addr = cfg->i2c_addr;
     } else {
-        addr = role_default_addr(role);
+        addr = MPU6050_I2C_ADDR_LOW;
     }
 
-    /* 3. 船体 10 轴 IMU (WIT 协议): 上电即工作, 只读不写, 没有配置流程 */
-    if (role == IMU_ROLE_HULL) {
-        ret = wit_probe(port, addr);
-        if (ret != ESP_OK && cfg->i2c_addr == 0) {
-            /* 默认地址不应答: 扫一遍总线 —— 既把实际应答的地址列出来方便排查接线,
-             * 也兜住"模块地址被上位机改过"的情况 */
-            ESP_LOGW(TAG, "[%s] 地址 0x%02X 无应答, 扫描总线...", role_name(role), addr);
-            uint8_t mpu_a = 0, wit_a = 0;
-            i2c_bus_scan(port, &mpu_a, &wit_a);
-            if (wit_a != 0) {
-                addr = wit_a;
-                ESP_LOGW(TAG, "[%s] 改用扫描到的地址 0x%02X", role_name(role), addr);
-                ret = wit_probe(port, addr);
-            }
-        }
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "[%s] 10 轴 IMU @0x%02X 无应答 (查 3.3V 供电/共地/SDA-SCL 是否接反; "
-                     "该总线由 PCA9685 的 servo_init() 建立)",
-                     role_name(role), addr);
-            return ret;
-        }
-        s_dev[role].i2c_addr    = addr;
-        s_dev[role].initialized = true;
-        ESP_LOGI(TAG, "[%s] 10 轴 IMU 就绪 @ 0x%02X (WIT 协议, 内部已解算姿态)",
-                 role_name(role), addr);
-        return ESP_OK;
-    }
-
-    /* 4. 以下为 MPU6050 (云台) 流程 */
+    /* 3. MPU6050 (云台) 流程 */
     ret = mpu_probe(port, addr);
     if (ret != ESP_OK) {
         if (cfg->i2c_addr != 0) {
@@ -696,8 +535,8 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
         /* 默认地址没有应答: 扫总线找一个 WHO_AM_I 正确的设备,
          * 既兜住"AD0 接反/悬空", 也兜住上电初期偶发 NACK */
         ESP_LOGW(TAG, "[%s] 地址 0x%02X 无应答, 扫描总线...", role_name(role), addr);
-        uint8_t mpu_a = 0, wit_a = 0;
-        i2c_bus_scan(port, &mpu_a, &wit_a);
+        uint8_t mpu_a = 0;
+        i2c_bus_scan(port, &mpu_a);
         if (mpu_a == 0) {
             ESP_LOGE(TAG, "[%s] 未找到 MPU6050 (检查接线/上电/AD0)", role_name(role));
             return ret;
@@ -711,7 +550,7 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
     s_dev[role].i2c_addr = addr;
     const uint8_t A = addr;   /* 简写, 下面所有寄存器操作都针对这颗 */
 
-    /* 5. 唤醒 MPU6050 (默认上电后处于 SLEEP 状态) */
+    /* 4. 唤醒 MPU6050 (默认上电后处于 SLEEP 状态) */
     ret = i2c_write_reg(port, A, REG_PWR_MGMT_1, PWR_MGMT_1_CLKSEL_PLL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[%s] 写 PWR_MGMT_1 失败: %s", role_name(role), esp_err_to_name(ret));
@@ -719,14 +558,14 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
     }
     vTaskDelay(pdMS_TO_TICKS(100));  /* 等待时钟稳定 */
 
-    /* 6. 低通滤波带宽 (必须先设 DLPF, 它决定陀螺输出速率, 再设分频) */
+    /* 5. 低通滤波带宽 (必须先设 DLPF, 它决定陀螺输出速率, 再设分频) */
     ret = i2c_write_reg(port, A, REG_CONFIG, (uint8_t)(MPU6050_DLPF_CFG & 0x07));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[%s] 写 CONFIG 失败: %s", role_name(role), esp_err_to_name(ret));
         goto err_cleanup;
     }
 
-    /* 7. 采样率分频: 基准 1kHz(DLPF 开启) / 8kHz(DLPF 关闭) */
+    /* 6. 采样率分频: 基准 1kHz(DLPF 开启) / 8kHz(DLPF 关闭) */
     ret = i2c_write_reg(port, A, REG_SMPLRT_DIV, (uint8_t)MPU6050_SMPLRT_DIV);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[%s] 写 SMPLRT_DIV 失败: %s", role_name(role), esp_err_to_name(ret));
@@ -736,7 +575,7 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
              MPU6050_DLPF_CFG,
              ((MPU6050_DLPF_CFG == 0) ? 8000 : 1000) / (1 + MPU6050_SMPLRT_DIV));
 
-    /* 8. 陀螺仪量程 + 关闭自检 */
+    /* 7. 陀螺仪量程 + 关闭自检 */
     s_dev[role].gyro_range = cfg->gyro_range;
     ret = i2c_write_reg(port, A, REG_GYRO_CONFIG,
                         GYRO_CONFIG_SELF_TEST_OFF | gyro_fs_sel(s_dev[role].gyro_range));
@@ -745,7 +584,7 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
         goto err_cleanup;
     }
 
-    /* 9. 加速度量程 + 关闭自检 */
+    /* 8. 加速度量程 + 关闭自检 */
     s_dev[role].accel_range = cfg->accel_range;
     ret = i2c_write_reg(port, A, REG_ACCEL_CONFIG,
                         ACCEL_CONFIG_SELF_TEST_OFF | accel_fs_sel(s_dev[role].accel_range));
@@ -754,7 +593,7 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
         goto err_cleanup;
     }
 
-    /* 10. 验证 WHO_AM_I */
+    /* 9. 验证 WHO_AM_I */
     uint8_t who = 0;
     ret = i2c_read_reg(port, A, REG_WHO_AM_I, &who);
     if (ret != ESP_OK || who != MPU6050_WHO_AM_I_VAL) {
@@ -774,7 +613,7 @@ esp_err_t imu_init_role(imu_role_t role, const imu_config_t *cfg)
     return ESP_OK;
 
 err_cleanup:
-    /* 只把该角色标记为失败, 不动总线 —— 另一颗可能已经正常工作 */
+    /* 只把该角色标记为失败, 不动总线 */
     s_dev[role].i2c_addr    = 0;
     s_dev[role].initialized = false;
     return ret;
@@ -789,11 +628,6 @@ esp_err_t imu_read_role(imu_role_t role, imu_data_t *out)
 
     const i2c_port_t port = s_port[role];
     const uint8_t    A    = s_dev[role].i2c_addr;
-
-    /* 船体 10 轴 IMU 走 WIT 协议, 寄存器/字节序都和 MPU6050 不同 */
-    if (role == IMU_ROLE_HULL) {
-        return wit_read(port, A, out);
-    }
 
     /* 从 ACCEL_XOUT_H 开始连续读 14 字节:
      *   [0..1]  AccX, [2..3]  AccY, [4..5]  AccZ,
@@ -851,15 +685,29 @@ esp_err_t imu_scan_role(imu_role_t role)
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t mpu_addr = 0, wit_addr = 0;
-    i2c_bus_scan(s_port[role], &mpu_addr, &wit_addr);
+    uint8_t mpu_addr = 0;
+    i2c_bus_scan(s_port[role], &mpu_addr);
 
     if (mpu_addr) {
         ESP_LOGW(TAG, "[%s] 总线上有 MPU6050 @ 0x%02X", role_name(role), mpu_addr);
     }
-    if (wit_addr) {
-        ESP_LOGW(TAG, "[%s] 总线上有 10 轴 IMU @ 0x%02X", role_name(role), wit_addr);
+    return ESP_OK;
+}
+
+esp_err_t imu_deinit_role(imu_role_t role)
+{
+    if (role >= IMU_ROLE_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!s_dev[role].initialized) return ESP_OK;
+
+    /* MPU6050 可以进 SLEEP 省电 */
+    if (role == IMU_ROLE_GIMBAL) {
+        i2c_write_reg(s_port[role], s_dev[role].i2c_addr, REG_PWR_MGMT_1, PWR_MGMT_1_SLEEP);
     }
+    s_dev[role].initialized = false;
+    s_dev[role].i2c_addr    = 0;
+    /* 刻意不动 s_bus_ready: 总线 (I2C1 由 servo 装) 不在这里释放,
+     * 这样重新 init 也不会重复 install。 */
+    ESP_LOGI(TAG, "[%s] 已单角色反初始化 (总线保留)", role_name(role));
     return ESP_OK;
 }
 
@@ -868,18 +716,22 @@ void imu_deinit(void)
 {
     for (int i = 0; i < IMU_ROLE_COUNT; i++) {
         if (!s_dev[i].initialized) continue;
-        /* MPU6050 可以进 SLEEP 省电; 船体 10 轴 IMU 有自己的电源管理, 不要写它 */
+        /* MPU6050 可以进 SLEEP 省电 */
         if (i == IMU_ROLE_GIMBAL) {
             i2c_write_reg(s_port[i], s_dev[i].i2c_addr, REG_PWR_MGMT_1, PWR_MGMT_1_SLEEP);
         }
         s_dev[i].initialized = false;
         s_dev[i].i2c_addr    = 0;
     }
-    /* 只释放本组件安装的 I2C0; I2C1 是 servo 组件为 PCA9685 装的, 不能删 */
-    if (s_bus_ready[IMU_ROLE_GIMBAL]) {
-        i2c_driver_delete(s_port[IMU_ROLE_GIMBAL]);
-        s_bus_ready[IMU_ROLE_GIMBAL] = false;
+    /* 只释放**本组件安装**的总线:
+     *   - I2C1 是 servo 组件为 PCA9685 装的, 不能删;
+     *   - 云台与 PCA9685 共用 I2C1, s_bus_owned 恒为假, 因此这里通常什么都不做。 */
+    for (int i = 0; i < IMU_ROLE_COUNT; i++) {
+        if (s_bus_owned[i]) {
+            i2c_driver_delete(s_port[i]);
+            s_bus_owned[i] = false;
+        }
+        s_bus_ready[i] = false;
     }
-    s_bus_ready[IMU_ROLE_HULL] = false;
     ESP_LOGI(TAG, "已反初始化");
 }

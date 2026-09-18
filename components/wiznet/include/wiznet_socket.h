@@ -22,7 +22,16 @@
 #include "wiznet_conf.h"
 #include "wizchip_conf.h"
 /* 使用带目录前缀的相对路径, 避免与 lwip 的 <sys/socket.h> 冲突 */
+/* ⚠️ ioLibrary 的 socket.h 里声明了 `int8_t close(uint8_t sn);` —— 与 newlib 的
+ *    `int close(int)` (经 <unistd.h> 带进来, main.c 的 linenoise.h 就会引到它)
+ *    是同名不同签名, 同一翻译单元里同时可见会报:
+ *      error: conflicting types for 'close'; have 'int(int)'
+ *    这里在包含 ioLibrary 头期间把该名字临时改掉 (只影响这次 include 出来的**声明**),
+ *    出栈后立即恢复 —— 于是存在的是 POSIX 的 close, 应用层一律用 wiz_close() 关闭 socket。
+ *    注: socket.h 内部并不调用 close(), 所以改名不影响它自身内容。 */
+#define close iolib_socket_close_decl_
 #include "../Ethernet/socket.h"  /* 透传 ioLibrary 常量/状态/寄存器宏 */
+#undef close
 
 #ifdef __cplusplus
 extern "C" {

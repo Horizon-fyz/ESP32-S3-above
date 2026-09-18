@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "servo.h"
 
 static const char *TAG = "gimbal";
@@ -33,6 +34,10 @@ static const char *TAG = "gimbal";
 /* 积分限幅 (°·s): 取小一点, 大误差阶段输出被速率限制饱和时积分仍在累积,
  * 限幅小才能避免饱和结束后多推一把造成过冲。ki=0.5 时最多贡献 5°。 */
 #define GIMBAL_INTEG_LIMIT         10.0f
+
+/* 姿态反馈有效期 (ms): 超过这么久没收到 gimbal_feed_attitude() (100Hz 喂入),
+ * 即判定为"无反馈" —— 云台 MPU 未就绪 / 零偏标定失败 / 读数中断。 */
+#define GIMBAL_FB_TIMEOUT_MS       200
 
 static gimbal_limit_t s_limit[GIMBAL_CH_COUNT];
 static gimbal_state_t s_state[GIMBAL_CH_COUNT];
@@ -58,9 +63,21 @@ static float s_fb_sign[GIMBAL_CH_COUNT] = {
     [0] = +1.0f, [1] = -1.0f,
 };
 
-/* 最近一次喂入的云台实测姿态 (物理角, °) */
-static volatile float s_meas_pitch = 0.0f;
-static volatile float s_meas_yaw   = 0.0f;
+/* 最近一次喂入的云台实测姿态 (物理角, °) 与喂入时刻 */
+static volatile float    s_meas_pitch   = 0.0f;
+static volatile float    s_meas_yaw     = 0.0f;
+static volatile uint64_t s_meas_feed_us = 0;    /* 0 = 从未喂过 */
+
+/* 各轴是否处于"无反馈"状态 (只在状态切换时回中位/打日志, 避免 100Hz 刷屏) */
+static bool s_stab_nofb[GIMBAL_CH_COUNT];
+
+/* 姿态反馈是否有效: 有效期内收到过喂入 */
+static bool gimbal_fb_valid(void)
+{
+    if (s_meas_feed_us == 0) return false;
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    return (now - s_meas_feed_us) <= (uint64_t)GIMBAL_FB_TIMEOUT_MS * 1000ULL;
+}
 
 /**
  * @brief 姿态闭环单步: 增量式 PID, 直接下发标称角
@@ -69,6 +86,40 @@ static void gimbal_stab_step(uint8_t ch, float dt)
 {
     gimbal_stab_state_t *st  = &s_stab[ch];
     const gimbal_pid_t  *pid = &s_pid[ch];
+
+    /* ---- 无反馈保护: 不跑 PID, 该轴送回标定中位 ----
+     * 云台 MPU 未就绪 / 零偏标定失败 / 读数中断时喂不进实测角, meas 会一直是
+     * 0 —— 那不是"真实水平"。若照跑 PID, 误差恒 0 会让输出停在 0°, 被行程
+     * 限位钳到下限 (ch1 = 30°) 把俯仰顶死。这里停 PID + 回中位, 反馈恢复后自动接管。 */
+    if (!gimbal_fb_valid()) {
+        st->nofb      = true;
+        st->meas_phys = 0.0f;
+        st->err       = 0.0f;
+        s_stab_i[ch].integ    = 0.0f;
+        s_stab_i[ch].err_prev = 0.0f;
+
+        if (!s_stab_nofb[ch]) {
+            s_stab_nofb[ch] = true;
+            st->cmd_deg = 0.0f;
+            if (servo_is_ready()) {
+                servo_center(ch);                        /* 中位脉宽 = (min+max)/2 + trim */
+                servo_get_angle(ch, &st->cmd_deg);       /* 由中位脉宽反算标称角 */
+                ESP_LOGW(TAG, "ch%u 无姿态反馈 (云台 MPU 未就绪 / 零偏标定失败 / 读数中断)"
+                              " => 停用闭环 PID, 回中位 %.1f°", ch, st->cmd_deg);
+            } else {
+                ESP_LOGW(TAG, "ch%u 无姿态反馈 (云台 MPU 未就绪 / 零偏标定失败 / 读数中断)"
+                              " => 停用闭环 PID (PCA9685 也未就绪, 无法回中位)", ch);
+            }
+        }
+        return;
+    }
+
+    if (s_stab_nofb[ch]) {
+        s_stab_nofb[ch] = false;
+        st->nofb = false;
+        ESP_LOGI(TAG, "ch%u 姿态反馈已恢复 => 重新启用闭环 PID (从当前 %.1f° 接管)",
+                 ch, st->cmd_deg);
+    }
 
     st->meas_phys = (ch == 1) ? s_meas_pitch : s_meas_yaw;
 
@@ -255,8 +306,9 @@ esp_err_t gimbal_get_state(uint8_t ch, gimbal_state_t *st)
 
 void gimbal_feed_attitude(float pitch_phys_deg, float yaw_phys_deg)
 {
-    s_meas_pitch = pitch_phys_deg;
-    s_meas_yaw   = yaw_phys_deg;
+    s_meas_pitch   = pitch_phys_deg;
+    s_meas_yaw     = yaw_phys_deg;
+    s_meas_feed_us = (uint64_t)esp_timer_get_time();   /* 供无反馈保护判定 */
 }
 
 esp_err_t gimbal_set_target_phys(uint8_t ch, float phys_deg)
@@ -297,6 +349,9 @@ esp_err_t gimbal_enable_stabilize(uint8_t ch, bool enable)
         s_stab[ch].err         = 0.0f;
         s_stab[ch].meas_phys   = s_stab[ch].target_phys;
         s_stab[ch].enabled     = true;
+        /* 复位无反馈标记: 由下一周期重新判定 (无反馈则回中位并打日志) */
+        s_stab[ch].nofb = false;
+        s_stab_nofb[ch] = false;
         ESP_LOGI(TAG, "ch%u 姿态闭环开启: 目标锁定当前姿态 %.1f° (标称 %.1f°)",
                  ch, s_stab[ch].target_phys, cur_cmd);
     } else {
@@ -304,6 +359,8 @@ esp_err_t gimbal_enable_stabilize(uint8_t ch, bool enable)
             return ESP_OK;
         }
         s_stab[ch].enabled = false;
+        s_stab[ch].nofb    = false;
+        s_stab_nofb[ch]    = false;
         /* 交还给规划器: 把规划点对齐到闭环最后的输出, 避免跳变 */
         s_state[ch].current_deg = s_stab[ch].cmd_deg;
         s_state[ch].target_deg  = s_stab[ch].cmd_deg;

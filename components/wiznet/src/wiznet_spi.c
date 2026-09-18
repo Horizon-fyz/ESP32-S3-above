@@ -19,12 +19,16 @@
  */
 
 #include "wiznet_spi.h"
+
+/* ⚠️ FreeRTOS(xtensa 系统头) 必须在 wiznet_conf.h / ioLibrary 之前: 后者会 #undef 掉
+ *    Xtensa 的 `MR`, 好让 w5500.h 的 `MR` 成为首次定义 (见 components/wiznet/include/wiznet_conf.h)。 */
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "wiznet_conf.h"
 #include "wizchip_conf.h"
 
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"

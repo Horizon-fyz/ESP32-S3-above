@@ -35,37 +35,13 @@ static uint8_t           s_buf[CTRL_CTRL_FRAME_SIZE];
 static size_t            s_buf_len     = 0;
 static uint32_t          s_frame_count = 0;
 static ctrl_forward_cb_t s_forward_cb  = NULL;
+static ctrl_local_cb_t   s_local_cb    = NULL;
 
-/* clamp int16 到 [-100, +100] */
-static inline int16_t clamp100(int16_t v)
-{
-    if (v >  100) return  100;
-    if (v < -100) return -100;
-    return v;
-}
-
-/* 差速混合并执行本地电机 (主节点)
- * speed: 整体速度 -100~+100 (正=前进)
- * yaw:   偏航 -100~+100 (正=右转) */
-static void mix_and_execute_local(int8_t speed, int8_t yaw)
-{
-    int16_t left  = (int16_t)speed + (int16_t)yaw;
-    int16_t right = (int16_t)speed - (int16_t)yaw;
-    left  = clamp100(left);
-    right = clamp100(right);
-
-    /* ESC1 = 左, ESC2 = 右 (假设此配置, 可按实际硬件调整) */
-    motor_set_esc_throttle(MOTOR_ESC_1, (float)left);
-    motor_set_esc_throttle(MOTOR_ESC_2, (float)right);
-
-    /* L298N DC: 速度=|speed|, 方向=sign(speed) */
-    uint8_t dc_pct = (uint8_t)((speed < 0) ? -speed : speed);
-    motor_dir_t dc_dir;
-    if (speed > 0)      dc_dir = MOTOR_DIR_FORWARD;
-    else if (speed < 0) dc_dir = MOTOR_DIR_REVERSE;
-    else                dc_dir = MOTOR_DIR_STOP;
-    motor_set_dc_speed(MOTOR_MAIN_DC, (float)dc_pct, dc_dir);
-}
+/* 差速混合与电机驱动已迁到 main.c —— 见 control.h 顶部说明.
+ * 本组件只解析协议, 通过 s_local_cb 把指令交给上层, 不碰任何电机:
+ * 原先这里写死了旧硬件 (2 路电调 + L298N 由 |speed| 驱动), 与现有
+ * "4 路单向电调 (正=推进/负=反推) + L298N 滚筒收放" 不符 ——
+ * 把负油门发给单向电调会被 motor_set_esc_throttle() 钳成 0, 反推两路永远不会动. */
 
 /* 紧急停止: 所有电机归零 (本地) */
 static void emergency_stop_local(void)
@@ -87,18 +63,32 @@ static void handle_ctrl_command(const uint8_t *frame)
         .target_depth_cm = (int16_t)(frame[3] | (frame[4] << 8)),
         .target_pitch_deg = (int8_t)frame[5],
         .target_roll_deg  = (int8_t)frame[6],
+        /* v9.2 SERVO 字段 (cmd=0x12) */
+        .servo_mask       = frame[7],
+        .servo_deg10      = { (int16_t)(frame[3] | (frame[4] << 8)),
+                              (int16_t)(frame[5] | (frame[6] << 8)) },
     };
 
     switch (cmd.cmd) {
     case CTRL_CMD_MOTOR:
         if (cmd.flags & CTRL_FLAG_ENABLE_LOCAL) {
-            mix_and_execute_local(cmd.speed, cmd.yaw);
+            /* 交给上层执行本地动作 (差速混合 + 4 路电调 + L298N 滚筒) */
+            if (s_local_cb) s_local_cb(&cmd);
         }
         if ((cmd.flags & CTRL_FLAG_FORWARD_REMOTE) && s_forward_cb) {
             s_forward_cb(&cmd);   /* 由 tcp_server 任务发 8B 子帧 */
         }
         ESP_LOGD(TAG, "CTRL speed=%d yaw=%d light=%d bucket=%d flags=0x%02X",
                  cmd.speed, cmd.yaw, cmd.remote_light, cmd.bucket_speed, cmd.flags);
+        break;
+
+    case CTRL_CMD_SERVO:
+        /* v9.2 云台手动: 只有掩码置位的通道会被上层动作 (mask=0 ⇒ 什么都不做) */
+        if ((cmd.flags & CTRL_FLAG_ENABLE_LOCAL) && cmd.servo_mask && s_local_cb) {
+            s_local_cb(&cmd);
+        }
+        ESP_LOGD(TAG, "CTRL SERVO mask=0x%02X ch0=%.1f° ch1=%.1f°",
+                 cmd.servo_mask, cmd.servo_deg10[0] / 10.0, cmd.servo_deg10[1] / 10.0);
         break;
 
     case CTRL_CMD_DEPTH:
@@ -251,6 +241,11 @@ void control_set_forward_callback(ctrl_forward_cb_t cb)
     s_forward_cb = cb;
 }
 
+void control_set_local_callback(ctrl_local_cb_t cb)
+{
+    s_local_cb = cb;
+}
+
 void control_reset(void)
 {
     s_state = CTRL_STATE_IDLE;
@@ -310,6 +305,57 @@ void control_build_mpu_frame(uint8_t *frame,
 
 /* v3.0 沉浮控制帧 (16B, cmd=0x11, 上位机→主控)
  *   [3-4] target_depth int16 LE (cm)  [5] target_pitch int8(°)  [6] target_roll int8(°)  [10] flags */
+
+/* GPS 状态帧 type=0x04 (定位): [3-6] lat ×1e7  [7-10] lon ×1e7
+ * [11-12] alt ×0.1m  [13] 卫星数  [14] flags —— 布局详见 control.h 顶部注释 */
+void control_build_gps_pos_frame(uint8_t *frame,
+    uint8_t flags, int32_t lat_e7, int32_t lon_e7, int16_t alt_dm, uint8_t sats)
+{
+    uint32_t lat = (uint32_t)lat_e7;
+    uint32_t lon = (uint32_t)lon_e7;
+
+    frame[0]  = CTRL_MPU_HEAD_0;
+    frame[1]  = CTRL_MPU_HEAD_1;
+    frame[2]  = CTRL_MPU_TYPE_GPS_POS;
+    frame[3]  = (uint8_t)( lat        & 0xFF);
+    frame[4]  = (uint8_t)((lat >>  8) & 0xFF);
+    frame[5]  = (uint8_t)((lat >> 16) & 0xFF);
+    frame[6]  = (uint8_t)((lat >> 24) & 0xFF);
+    frame[7]  = (uint8_t)( lon        & 0xFF);
+    frame[8]  = (uint8_t)((lon >>  8) & 0xFF);
+    frame[9]  = (uint8_t)((lon >> 16) & 0xFF);
+    frame[10] = (uint8_t)((lon >> 24) & 0xFF);
+    frame[11] = (uint8_t)((uint16_t)alt_dm & 0xFF);
+    frame[12] = (uint8_t)(((uint16_t)alt_dm >> 8) & 0xFF);
+    frame[13] = sats;
+    frame[14] = flags;
+    frame[15] = calc_crc8(frame, 15);
+}
+
+/* GPS 状态帧 type=0x05 (运动/精度/时间): 布局详见 control.h 顶部注释 */
+void control_build_gps_nav_frame(uint8_t *frame,
+    uint8_t flags, uint16_t course_cdeg, uint16_t speed_ckmh,
+    uint8_t pdop_d1, uint8_t hdop_d1, uint8_t vdop_d1,
+    uint8_t hour, uint8_t minute, uint8_t second)
+{
+    frame[0]  = CTRL_MPU_HEAD_0;
+    frame[1]  = CTRL_MPU_HEAD_1;
+    frame[2]  = CTRL_MPU_TYPE_GPS_NAV;
+    frame[3]  = (uint8_t)(course_cdeg & 0xFF);
+    frame[4]  = (uint8_t)((course_cdeg >> 8) & 0xFF);
+    frame[5]  = (uint8_t)(speed_ckmh & 0xFF);
+    frame[6]  = (uint8_t)((speed_ckmh >> 8) & 0xFF);
+    frame[7]  = pdop_d1;
+    frame[8]  = hdop_d1;
+    frame[9]  = vdop_d1;
+    frame[10] = hour;
+    frame[11] = minute;
+    frame[12] = second;
+    frame[13] = flags;
+    frame[14] = 0;
+    frame[15] = calc_crc8(frame, 15);
+}
+
 void control_build_depth_ctrl_frame(uint8_t *frame,
     int16_t target_depth_cm, int8_t target_pitch, int8_t target_roll, uint8_t flags)
 {

@@ -181,11 +181,12 @@ servo_config_t servo_get_default_config(void)
 {
     servo_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.sda_gpio    = 21;          /* v5.10 换板: I2C1 SDA */
+    cfg.sda_gpio    = 16;          /* v8.0: 原 21 —— GPIO21 是板载 WS2812 数据脚, 让开 */
     cfg.scl_gpio    = 17;          /* v5.10 换板: I2C1 SCL */
     cfg.i2c_freq_hz = 400 * 1000;
     cfg.i2c_addr    = 0x40;
     cfg.pwm_freq_hz = 50;          /* 标准舵机 50Hz */
+    cfg.pca9685_enable = true;     /* 默认启用; 置 false = 暂时关停 (见 servo.h) */
     return cfg;
 }
 
@@ -217,12 +218,29 @@ esp_err_t servo_init(const servo_config_t *cfg)
         return ret;
     }
 
+    /* 1b. [暂时关停] 只保留总线, 不探测/不驱动 PCA9685
+     *     I2C1 上还挂着云台 MPU6050 (0x68, 由 imu 组件借用), 所以总线照装不误;
+     *     只是不碰 PCA9685 —— s_initialized 保持 false, 所有 servo API 直接返回
+     *     ESP_ERR_INVALID_STATE, 不会往不存在的芯片写。 */
+    if (!cfg->pca9685_enable) {
+        ESP_LOGW(TAG, "PCA9685 已关停 (pca9685_enable=false): I2C%d 总线已装好并保留给云台 MPU6050, 舵机功能关闭",
+                 (int)I2C_MASTER_NUM);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     /* 2. 探测设备 */
     uint8_t mode1 = 0;
     ret = i2c_read(0x00, &mode1);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PCA9685 not found at 0x%02X", s_i2c_addr);
-        i2c_driver_delete(I2C_MASTER_NUM);
+        /* ⚠️ v5.11.2 起: 这里**不删 I2C1 总线**。
+         * 该总线还挂着云台 MPU6050 (0x68), 由 imu 组件借用 (它不重复 install)。
+         * 若在此 i2c_driver_delete(), 亚博 IMU 会一起失效, 且后续 `scan 1` / `hull`
+         * 在线重探也全部报 "i2c driver not installed" —— 只能重启才能再试。
+         * 保留总线: servo 自身功能关闭 (s_initialized 保持 false, 所有 servo API 直接
+         * 返回 ESP_ERR_INVALID_STATE, 不会往不存在的芯片写), 但云台 MPU 照常工作。 */
+        ESP_LOGW(TAG, "I2C%d 总线保留给云台 MPU6050 使用 (PCA9685 不可用, servo 功能关闭)",
+                 (int)I2C_MASTER_NUM);
         return ESP_ERR_NOT_FOUND;
     }
     ESP_LOGI(TAG, "PCA9685 found at 0x%02X (MODE1=0x%02X)", s_i2c_addr, mode1);
@@ -233,11 +251,13 @@ esp_err_t servo_init(const servo_config_t *cfg)
     vTaskDelay(pdMS_TO_TICKS(5));
 
     /* 4. 设置预分频 -> PWM 频率 */
-    /* prescale = round(25e6 / (4096 * freq)) - 1 */
+    /* prescale = round(25e6 / (4096 * freq)) - 1, 有效范围 3~255
+     * ⚠️ 夹取必须在 float 上做: prescale 是 uint8_t, 再写 `if (prescale > 255)` 会触发
+     *    `-Wtype-limits`(比较恒为假) 警告。*/
     float prescale_f = (float)PCA9685_OSC_HZ / (4096.0f * cfg->pwm_freq_hz) - 1.0f;
+    if (prescale_f < 3.0f)   prescale_f = 3.0f;
+    if (prescale_f > 255.0f) prescale_f = 255.0f;
     uint8_t prescale = (uint8_t)(prescale_f + 0.5f);
-    if (prescale < 3) prescale = 3;
-    if (prescale > 255) prescale = 255;
     ret = i2c_write(0xFE, prescale);
     if (ret != ESP_OK) return ret;
     ESP_LOGI(TAG, "PWM freq=%d Hz, prescale=%d", cfg->pwm_freq_hz, prescale);
@@ -535,6 +555,8 @@ bool servo_is_ready(void)
 
 void servo_deinit(void)
 {
+    /* 只有成功初始化过才释放总线。若当初 PCA9685 就探测失败 (s_initialized=false),
+     * 这条 I2C1 是**留给云台 MPU6050** 的 (见 servo_init 探测失败分支), 不能在这里删。 */
     if (s_initialized) {
         servo_sleep_all();
         i2c_driver_delete(I2C_MASTER_NUM);
